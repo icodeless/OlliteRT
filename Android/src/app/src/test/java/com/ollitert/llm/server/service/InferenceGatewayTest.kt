@@ -478,6 +478,7 @@ class InferenceGatewayTest {
     InferenceGateway.executeStreaming(
       prompt = "timeout",
       timeoutSeconds = 1,
+      watchdogPolicy = InferenceWatchdogPolicy(1_000L, 1_000L),
       executor = directExecutor,
       inferenceLock = lock,
       resetConversation = { prepareCount.incrementAndGet() },
@@ -902,13 +903,14 @@ class InferenceGatewayTest {
     assertTrue("onInferenceFinished must be called on exception path", finishedCalled)
   }
 
-  // Uses 1s real-time wait — CountDownLatch.await() can't use virtual time (Java blocking primitive).
+  // Uses an explicit 1s startup watchdog; there is no total-generation timeout.
   @Test
   fun streamingOnInferenceFinishedCalledOnTimeout() {
     var finishedCalled = false
     InferenceGateway.executeStreaming(
       prompt = "p",
       timeoutSeconds = 1,
+      watchdogPolicy = InferenceWatchdogPolicy(1_000L, 1_000L),
       executor = directExecutor,
       inferenceLock = lock,
       resetConversation = {},

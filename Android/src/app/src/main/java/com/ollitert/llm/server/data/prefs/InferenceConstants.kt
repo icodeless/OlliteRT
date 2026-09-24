@@ -22,6 +22,10 @@ import com.ollitert.llm.server.data.model.Accelerator
 const val MIN_MAX_TOKENS = 100
 const val MAX_MAX_TOKENS = 32768
 const val DEFAULT_MAX_TOKEN = 1024
+/** Independent fallback context capacity for imported models without metadata. */
+const val DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS = 8_192
+const val MIN_MAX_CONTEXT_TOKENS = 1_024
+const val MAX_MAX_CONTEXT_TOKENS = 32_768
 const val MIN_TOPK = 5
 const val MAX_TOPK = 100
 const val DEFAULT_TOPK = 64

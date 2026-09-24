@@ -187,17 +187,17 @@ class ConfigTest {
   }
 
   @Test
-  fun createLlmChatConfigsMaxTokensIsLabelByDefault() {
+  fun createLlmChatConfigsMaxTokensIsOutputSliderByDefault() {
     val configs = createLlmChatConfigs()
     val maxTokensConfig = configs.first { it.key.id == "max_tokens" }
-    assertTrue("without context length, max_tokens should be LabelConfig", maxTokensConfig is LabelConfig)
+    assertTrue("max_tokens should be a NumberSliderConfig", maxTokensConfig is NumberSliderConfig)
   }
 
   @Test
-  fun createLlmChatConfigsMaxTokensIsSliderWithContextLength() {
-    val configs = createLlmChatConfigs(defaultMaxContextLength = 8000)
+  fun createLlmChatConfigsMaxTokensSliderUsesOutputLimit() {
+    val configs = createLlmChatConfigs(defaultMaxToken = 8000)
     val maxTokensConfig = configs.first { it.key.id == "max_tokens" }
-    assertTrue("with context length, max_tokens should be NumberSliderConfig", maxTokensConfig is NumberSliderConfig)
+    assertTrue("max_tokens should be NumberSliderConfig", maxTokensConfig is NumberSliderConfig)
     val slider = maxTokensConfig as NumberSliderConfig
     assertEquals(8000f, slider.sliderMax, 0.01f)
   }

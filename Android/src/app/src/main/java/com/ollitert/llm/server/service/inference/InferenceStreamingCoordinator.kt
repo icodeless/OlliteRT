@@ -27,10 +27,10 @@ import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.repository.RequestLogStore
 import com.ollitert.llm.server.data.prefs.RequestPrefsSnapshot
 import com.ollitert.llm.server.data.prefs.SSE_PING_INTERVAL_MS
-import com.ollitert.llm.server.data.prefs.STREAM_OUTER_TIMEOUT_SAFETY_BUFFER_SECONDS
 import com.ollitert.llm.server.data.prefs.ServerPrefs
 import com.ollitert.llm.server.data.model.llmSupportAudio
 import com.ollitert.llm.server.data.model.llmSupportImage
+import com.ollitert.llm.server.data.model.effectiveMaxOutputTokens
 import com.ollitert.llm.server.runtime.ServerLlmModelHelper
 import com.ollitert.llm.server.service.formats.StreamingFormat
 import com.ollitert.llm.server.service.http.HttpResponse
@@ -84,6 +84,12 @@ internal class InferenceStreamingCoordinator(
     maxOutputToken: Int? = null,
   ): HttpResponse {
     val streamStartMs = SystemClock.elapsedRealtime()
+    val completionEvidence = InferenceCompletionEvidence(streamStartMs)
+    val watchdogPolicy = InferenceWatchdogPolicy.DEFAULT
+    val nativeContextBefore = ServerLlmModelHelper.getConversationTokenCount(model)
+    val effectiveOutputTokens = maxOutputToken
+      ?: model.engineMaxOutputTokens.takeIf { it > 0 }
+      ?: model.effectiveMaxOutputTokens
     ServerMetrics.addTokensIn(estimateTokensLong(prompt))
     ServerMetrics.recordModality(hasImages = images.isNotEmpty(), hasAudio = audioClips.isNotEmpty())
 
@@ -145,8 +151,7 @@ internal class InferenceStreamingCoordinator(
     val streamPreview = prefs?.streamLogsPreview ?: ServerPrefs.isStreamLogsPreview(context)
     val keepPartial = prefs?.keepPartialResponse ?: ServerPrefs.isKeepPartialResponse(context)
 
-    val outerTimeoutMs = (timeoutSeconds + 2 * STREAM_OUTER_TIMEOUT_SAFETY_BUFFER_SECONDS) * 1000
-    return HttpResponse.Sse(outerTimeoutMs = outerTimeoutMs) { writer ->
+    return HttpResponse.Sse(outerTimeoutMs = null) { writer ->
       val channel = Channel<StreamEvent>(Channel.UNLIMITED)
       channelRef.set(channel)
       val state = StreamState(
@@ -159,6 +164,10 @@ internal class InferenceStreamingCoordinator(
         keepPartial,
         inferenceControl,
         onConversationFinished,
+        completionEvidence,
+        nativeContextBefore,
+        effectiveOutputTokens,
+        watchdogPolicy,
         onLogEvent = { msg -> logEvent(msg) },
       )
 
@@ -211,7 +220,10 @@ internal class InferenceStreamingCoordinator(
             state.markStarted()
           }
         },
-        runInference = session::runInference,
+         runInference = session::runInference,
+         runInferenceWithDiagnostics = { input, onPartial, onError, onNativeTerminal ->
+           session.runInference(input, onPartial, onError, onNativeTerminal)
+         },
         cancelInference = { ServerLlmModelHelper.stopResponse(model) },
         recoverConversation = session::recoverConversation,
         onToken = { partial, done, thought ->
@@ -225,17 +237,21 @@ internal class InferenceStreamingCoordinator(
           state.markMetricsCompleted()
         },
         onCaughtThrowable = { t -> emitDebugStackTrace(t, format.sourceTag, model.name) },
-        onExecutionReady = { control ->
+         onExecutionReady = { control ->
           inferenceControl.set(control)
           cancellationBridge.attach(control)
-          if (cancellationBridge.cancellationWasAccepted()) channel.close()
-        },
-        runtimeHealth = runtimeHealth,
+           if (cancellationBridge.cancellationWasAccepted()) channel.close()
+         },
+         onGatewayOutcome = completionEvidence::recordGatewayOutcome,
+         onNativeProgress = completionEvidence::recordNativeProgress,
+         onNativeTerminalSignal = completionEvidence::recordNativeSignal,
+         onTimeoutKind = completionEvidence::recordTimeoutKind,
+         watchdogPolicy = watchdogPolicy,
+          runtimeHealth = runtimeHealth,
       )
 
       try {
-        kotlinx.coroutines.withTimeout((timeoutSeconds + STREAM_OUTER_TIMEOUT_SAFETY_BUFFER_SECONDS) * 1000) {
-          for (event in channel) {
+        for (event in channel) {
             if (writer.isCancelled) {
               val elapsedMs = state.elapsedMs()
               Log.i(TAG, "STREAM_DISCONNECT requestId=$requestId endpoint=$endpoint elapsedMs=$elapsedMs " +
@@ -271,7 +287,6 @@ internal class InferenceStreamingCoordinator(
                 state.handleError(event.error, writer, channel, format)
               }
             }
-          }
         }
         if (!state.inferenceCompleted) {
           state.markCompleted()
@@ -297,6 +312,7 @@ internal class InferenceStreamingCoordinator(
       } finally {
         state.markCompleted()
         state.markMetricsCompleted()
+        state.ensureCompletionDiagnostic()
         if (state.inferenceStarted) state.finishConversation(isReusable = false)
         heartbeatJob?.cancel()
         heartbeatScope?.cancel()

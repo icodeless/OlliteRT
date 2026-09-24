@@ -46,12 +46,10 @@ sealed class HttpResponse {
 
   data class Sse(
     override val statusCode: Int = 200,
-    // Outer safety-net timeout (ms) for the SSE writer coroutine. Must stay strictly
-    // above the inner streaming timeout (InferenceRunner.streamInference) so it only
-    // fires when the inner timeout + cleanup fails to unwind. Streaming handlers set
-    // this from the user's configurable per-endpoint timeout; trivial empty-stream
-    // responses keep the default.
-    val outerTimeoutMs: Long = DEFAULT_SSE_OUTER_TIMEOUT_MS,
+    // Optional safety-net timeout (ms) for the SSE writer coroutine. A null value
+    // means the response is governed by the inference watchdog rather than a total
+    // wall-clock deadline. Trivial empty-stream responses keep the default.
+    val outerTimeoutMs: Long? = DEFAULT_SSE_OUTER_TIMEOUT_MS,
     val writer: suspend (SseWriter) -> Unit,
   ) : HttpResponse()
 }

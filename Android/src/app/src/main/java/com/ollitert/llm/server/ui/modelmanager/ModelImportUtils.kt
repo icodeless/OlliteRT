@@ -32,16 +32,19 @@ import com.ollitert.llm.server.data.prefs.Config
 import com.ollitert.llm.server.data.prefs.ConfigKey
 import com.ollitert.llm.server.data.prefs.ConfigKeys
 import com.ollitert.llm.server.data.prefs.DEFAULT_MAX_TOKEN
+import com.ollitert.llm.server.data.prefs.DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS
 import com.ollitert.llm.server.data.prefs.DEFAULT_TEMPERATURE
 import com.ollitert.llm.server.data.prefs.DEFAULT_TOPK
 import com.ollitert.llm.server.data.prefs.DEFAULT_TOPP
 import com.ollitert.llm.server.data.prefs.EditableTextConfig
 import com.ollitert.llm.server.data.prefs.LabelConfig
 import com.ollitert.llm.server.data.prefs.MAX_MAX_TOKENS
+import com.ollitert.llm.server.data.prefs.MAX_MAX_CONTEXT_TOKENS
 import com.ollitert.llm.server.data.prefs.MAX_TEMPERATURE
 import com.ollitert.llm.server.data.prefs.MAX_TOPK
 import com.ollitert.llm.server.data.prefs.MAX_TOPP
 import com.ollitert.llm.server.data.prefs.MIN_MAX_TOKENS
+import com.ollitert.llm.server.data.prefs.MIN_MAX_CONTEXT_TOKENS
 import com.ollitert.llm.server.data.prefs.MIN_TEMPERATURE
 import com.ollitert.llm.server.data.prefs.MIN_TOPK
 import com.ollitert.llm.server.data.prefs.MIN_TOPP
@@ -81,6 +84,14 @@ internal fun buildImportConfigsLlm(context: Context, fileExtension: String): Lis
       sliderMin = MIN_MAX_TOKENS.toFloat(),
       sliderMax = MAX_MAX_TOKENS.toFloat(),
       defaultValue = DEFAULT_MAX_TOKEN.toFloat(),
+      valueType = ValueType.INT,
+      allowAboveMax = true,
+    ),
+    NumberSliderConfig(
+      key = ConfigKeys.DEFAULT_MAX_CONTEXT_TOKENS,
+      sliderMin = MIN_MAX_CONTEXT_TOKENS.toFloat(),
+      sliderMax = MAX_MAX_CONTEXT_TOKENS.toFloat(),
+      defaultValue = DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS.toFloat(),
       valueType = ValueType.INT,
       allowAboveMax = true,
     ),

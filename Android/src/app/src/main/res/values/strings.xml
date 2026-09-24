@@ -974,6 +974,7 @@
   <string name="config_label_topp" translatable="false">TopP</string>
   <string name="config_label_temperature" translatable="false">Temperature</string>
   <string name="config_label_default_max_tokens" translatable="false">Default max tokens</string>
+  <string name="config_label_default_max_context_tokens" translatable="false">Default max context</string>
   <string name="config_label_default_topk" translatable="false">Default TopK</string>
   <string name="config_label_default_topp" translatable="false">Default TopP</string>
   <string name="config_label_default_temperature" translatable="false">Default temperature</string>

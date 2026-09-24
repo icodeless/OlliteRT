@@ -30,6 +30,7 @@ import com.ollitert.llm.server.data.prefs.LOG_ERROR_PREVIEW_SHORT_CHARS
 import com.ollitert.llm.server.data.model.LogLevel
 import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.repository.RequestLogStore
+import com.ollitert.llm.server.service.inference.NativeTerminalSignal
 import kotlinx.coroutines.CoroutineScope
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
@@ -169,6 +170,11 @@ object ServerLlmModelHelper {
       }
       cleanUpListeners.remove(model.name)?.invoke()
       model.instance = null
+      model.engineContextTokens = 0
+      model.engineContextSource = "unknown"
+      model.engineMaxOutputTokens = 0
+      model.engineSafetyReserveTokens = 0
+      model.engineUsableInputTokens = 0
       System.gc()
     }
   }
@@ -182,11 +188,23 @@ object ServerLlmModelHelper {
       Log.w(TAG, "Error during model cleanup: ${e.message}")
     }
     model.instance = null
+    model.engineContextTokens = 0
+    model.engineContextSource = "unknown"
+    model.engineMaxOutputTokens = 0
+    model.engineSafetyReserveTokens = 0
+    model.engineUsableInputTokens = 0
     System.gc()
   }
 
   fun cleanUp(model: Model, onDone: () -> Unit) {
-    val instance = model.instance as? LlmModelInstance ?: return
+    val instance = model.instance as? LlmModelInstance ?: run {
+      model.engineContextTokens = 0
+      model.engineContextSource = "unknown"
+      model.engineMaxOutputTokens = 0
+      model.engineSafetyReserveTokens = 0
+      model.engineUsableInputTokens = 0
+      return
+    }
 
     try {
       instance.conversation.close()
@@ -202,6 +220,11 @@ object ServerLlmModelHelper {
 
     cleanUpListeners.remove(model.name)?.invoke()
     model.instance = null
+    model.engineContextTokens = 0
+    model.engineContextSource = "unknown"
+    model.engineMaxOutputTokens = 0
+    model.engineSafetyReserveTokens = 0
+    model.engineUsableInputTokens = 0
 
     onDone()
     Log.d(TAG, "Clean up done.")
@@ -213,6 +236,17 @@ object ServerLlmModelHelper {
       instance.conversation.cancelProcess()
     } catch (_: IllegalStateException) {
       Log.d(TAG, "stopResponse: conversation already closed, skipping cancel")
+    }
+  }
+
+  /** Returns LiteRT-LM's native token count for the active conversation, when available. */
+  fun getConversationTokenCount(model: Model): Long {
+    val instance = model.instance as? LlmModelInstance ?: return 0L
+    return try {
+      instance.conversation.getTokenCount().toLong().coerceAtLeast(0L)
+    } catch (e: Throwable) {
+      Log.d(TAG, "Conversation token count unavailable for '${model.name}': ${e.message}")
+      0L
     }
   }
 
@@ -241,6 +275,9 @@ object ServerLlmModelHelper {
     // Per-turn output token cap applied natively on top of the engine-level
     // maxNumTokens so client max_tokens requests are honored exactly.
     maxOutputToken: Int? = null,
+    // Preserves the native callback signal before compatibility mapping turns cancellation
+    // into the historical completion-shaped resultListener callback.
+    onNativeTerminalSignal: ((NativeTerminalSignal) -> Unit)? = null,
   ) {
     val instance = model.instance as? LlmModelInstance
     if (instance == null) {
@@ -256,6 +293,16 @@ object ServerLlmModelHelper {
 
     // Incremental path: send just the new user turn as a Message.user
     if (incrementalUserText != null) {
+      val nativeTerminalReported = AtomicBoolean(false)
+      fun reportNativeTerminal(signal: NativeTerminalSignal) {
+        if (nativeTerminalReported.compareAndSet(false, true)) {
+          try {
+            onNativeTerminalSignal?.invoke(signal)
+          } catch (callbackError: Throwable) {
+            Log.w(TAG, "Native terminal diagnostic callback failed", callbackError)
+          }
+        }
+      }
       conversation.sendMessageAsync(
         Message.user(incrementalUserText),
         object : MessageCallback {
@@ -265,7 +312,10 @@ object ServerLlmModelHelper {
             }
             resultListener(message.toString(), false, message.channels["thought"])
           }
-          override fun onDone() { resultListener("", true, null) }
+          override fun onDone() {
+            reportNativeTerminal(NativeTerminalSignal.ON_DONE)
+            resultListener("", true, null)
+          }
           override fun onError(throwable: Throwable) {
             if (conversationCacheGeneration != null) {
               discardCachedTurns(model.name, conversationCacheGeneration)
@@ -274,8 +324,10 @@ object ServerLlmModelHelper {
             }
             if (throwable is CancellationException) {
               Log.i(TAG, "The inference is cancelled (incremental).")
+              reportNativeTerminal(NativeTerminalSignal.CANCELLATION_EXCEPTION)
               resultListener("", true, null)
             } else {
+              reportNativeTerminal(NativeTerminalSignal.ON_ERROR)
               Log.e(TAG, "Incremental inference onError for '${model.name}': " +
                 "[${throwable::class.simpleName}] ${throwable.message}", throwable)
               onError("Error: ${throwable.message}")
@@ -297,6 +349,16 @@ object ServerLlmModelHelper {
       audioClips = audioClips,
     )
 
+    val nativeTerminalReported = AtomicBoolean(false)
+    fun reportNativeTerminal(signal: NativeTerminalSignal) {
+      if (nativeTerminalReported.compareAndSet(false, true)) {
+        try {
+          onNativeTerminalSignal?.invoke(signal)
+        } catch (callbackError: Throwable) {
+          Log.w(TAG, "Native terminal diagnostic callback failed", callbackError)
+        }
+      }
+    }
     conversation.sendMessageAsync(
       contents,
       object : MessageCallback {
@@ -308,14 +370,17 @@ object ServerLlmModelHelper {
         }
 
         override fun onDone() {
+          reportNativeTerminal(NativeTerminalSignal.ON_DONE)
           resultListener("", true, null)
         }
 
         override fun onError(throwable: Throwable) {
           if (throwable is CancellationException) {
             Log.i(TAG, "The inference is cancelled.")
+            reportNativeTerminal(NativeTerminalSignal.CANCELLATION_EXCEPTION)
             resultListener("", true, null)
           } else {
+            reportNativeTerminal(NativeTerminalSignal.ON_ERROR)
             Log.e(TAG, "Inference onError for '${model.name}': " +
               "[${throwable::class.simpleName}] ${throwable.message}", throwable)
             onError("Error: ${throwable.message}")

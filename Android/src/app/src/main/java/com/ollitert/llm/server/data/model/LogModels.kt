@@ -18,6 +18,7 @@ package com.ollitert.llm.server.data.model
 
 import androidx.compose.runtime.Immutable
 import com.ollitert.llm.server.common.ErrorCategory
+import com.ollitert.llm.server.service.inference.InferenceCompletionDiagnostic
 
 enum class LogLevel { DEBUG, INFO, WARNING, ERROR }
 
@@ -98,4 +99,6 @@ data class RequestLogEntry(
   val prefillSpeed: Double = 0.0,
   /** Inter-token latency in ms (average time between consecutive output tokens). */
   val itlMs: Double = 0.0,
+  /** Native/gateway termination evidence; null for non-inference or legacy entries. */
+  val completionDiagnostic: InferenceCompletionDiagnostic? = null,
 )

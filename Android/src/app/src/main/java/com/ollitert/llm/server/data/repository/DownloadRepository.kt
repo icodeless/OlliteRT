@@ -133,6 +133,97 @@ class DownloadRepository @Inject constructor(
     )
   }
 
+  /**
+   * Reconnects a presentation layer to an existing WorkManager download without enqueuing a
+   * second worker. This is used after process recreation; the worker remains the authority for
+   * download execution and progress.
+   */
+  fun observeExistingModelDownload(
+    model: Model,
+    onStatusUpdated: (model: Model, status: ModelDownloadStatus) -> Unit,
+  ) {
+    val liveData = workManager.getWorkInfosForUniqueWorkLiveData(model.name)
+    var observer: androidx.lifecycle.Observer<List<WorkInfo>>? = null
+    var lastReceivedBytes = 0L
+    var lastTotalBytes = model.totalBytes
+    observer = androidx.lifecycle.Observer { workInfos ->
+      val workInfo = workInfos.firstOrNull {
+        it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.RUNNING
+      } ?: workInfos.firstOrNull()
+      if (workInfo == null) return@Observer
+
+      when (workInfo.state) {
+        WorkInfo.State.ENQUEUED -> {
+          onStatusUpdated(
+            model,
+            ModelDownloadStatus(
+              status = ModelDownloadStatusType.IN_PROGRESS,
+              totalBytes = model.totalBytes,
+            ),
+          )
+        }
+
+        WorkInfo.State.RUNNING -> {
+          val receivedBytes = workInfo.progress.getLong(KEY_MODEL_DOWNLOAD_RECEIVED_BYTES, 0L)
+          val downloadRate = workInfo.progress.getLong(KEY_MODEL_DOWNLOAD_RATE, 0L)
+          val startUnzipping = workInfo.progress.getBoolean(KEY_MODEL_START_UNZIPPING, false)
+          if (startUnzipping) {
+            onStatusUpdated(
+              model,
+              ModelDownloadStatus(status = ModelDownloadStatusType.UNZIPPING),
+            )
+          } else {
+            lastReceivedBytes = receivedBytes
+            lastTotalBytes = model.totalBytes
+            onStatusUpdated(
+              model,
+              ModelDownloadStatus(
+                status = ModelDownloadStatusType.IN_PROGRESS,
+                totalBytes = model.totalBytes,
+                receivedBytes = receivedBytes,
+                bytesPerSecond = downloadRate,
+              ),
+            )
+          }
+        }
+
+        WorkInfo.State.SUCCEEDED -> {
+          try {
+            onStatusUpdated(model, ModelDownloadStatus(status = ModelDownloadStatusType.SUCCEEDED))
+          } finally {
+            observer?.let { liveData.removeObserver(it) }
+          }
+        }
+
+        WorkInfo.State.FAILED,
+        WorkInfo.State.CANCELLED -> {
+          try {
+            val errorMessage = workInfo.outputData.getString(KEY_MODEL_DOWNLOAD_ERROR_MESSAGE) ?: ""
+            val status = if (workInfo.state == WorkInfo.State.CANCELLED) {
+              ModelDownloadStatusType.NOT_DOWNLOADED
+            } else {
+              ModelDownloadStatusType.FAILED
+            }
+            onStatusUpdated(
+              model,
+              ModelDownloadStatus(
+                status = status,
+                errorMessage = errorMessage,
+                receivedBytes = if (status == ModelDownloadStatusType.FAILED) lastReceivedBytes else 0L,
+                totalBytes = if (status == ModelDownloadStatusType.FAILED) lastTotalBytes else 0L,
+              ),
+            )
+          } finally {
+            observer?.let { liveData.removeObserver(it) }
+          }
+        }
+
+        else -> Unit
+      }
+    }
+    liveData.observeForever(observer)
+  }
+
   fun cancelDownloadModel(model: Model) {
     workManager.cancelAllWorkByTag("$MODEL_NAME_TAG:${model.name}")
   }

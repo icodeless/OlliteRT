@@ -37,18 +37,19 @@ import com.ollitert.llm.server.data.prefs.LOG_ERROR_PREVIEW_SHORT_CHARS
 import com.ollitert.llm.server.data.prefs.LOG_STREAMING_PREVIEW_DEBOUNCE_MS
 import com.ollitert.llm.server.data.model.LogLevel
 import com.ollitert.llm.server.data.model.Model
+import com.ollitert.llm.server.data.model.maxContextTokens
+import com.ollitert.llm.server.data.model.modelMaxContextTokens
+import com.ollitert.llm.server.data.model.effectiveMaxOutputTokens
 import com.ollitert.llm.server.data.prefs.RESPONSES_TIMEOUT_SECONDS
 import com.ollitert.llm.server.data.model.RequestLogEntry
 import com.ollitert.llm.server.data.repository.RequestLogStore
 import com.ollitert.llm.server.data.prefs.RequestPrefsSnapshot
 import com.ollitert.llm.server.data.prefs.SSE_PING_INTERVAL_MS
-import com.ollitert.llm.server.data.prefs.STREAM_OUTER_TIMEOUT_SAFETY_BUFFER_SECONDS
 import com.ollitert.llm.server.data.prefs.ServerPrefs
 import com.ollitert.llm.server.data.prefs.WARMUP_MESSAGE
 import com.ollitert.llm.server.data.model.llmSupportAudio
 import com.ollitert.llm.server.data.model.llmSupportImage
 import com.ollitert.llm.server.data.prefs.maxTokensInt
-import com.ollitert.llm.server.data.prefs.maxTokensLong
 import com.ollitert.llm.server.runtime.ServerLlmModelHelper
 import com.ollitert.llm.server.service.formats.AnthropicMessagesFormat
 import com.ollitert.llm.server.service.formats.ChatCompletionsFormat
@@ -156,6 +157,12 @@ class InferenceRunner(
     presencePenalty: Double? = null,
     maxOutputToken: Int? = null,
   ): Pair<String?, String?> {
+    val completionEvidence = InferenceCompletionEvidence(SystemClock.elapsedRealtime())
+    val watchdogPolicy = InferenceWatchdogPolicy.DEFAULT
+    val nativeContextBefore = ServerLlmModelHelper.getConversationTokenCount(model)
+    val effectiveOutputTokens = maxOutputToken
+      ?: model.engineMaxOutputTokens.takeIf { it > 0 }
+      ?: model.effectiveMaxOutputTokens
     // Track input tokens (rough estimate: ~4 chars per token)
     ServerMetrics.addTokensIn(estimateTokensLong(prompt))
     // Track request modality
@@ -212,6 +219,9 @@ class InferenceRunner(
         }
       },
       runInference = session::runInference,
+      runInferenceWithDiagnostics = { input, onPartial, onError, onNativeTerminal ->
+        session.runInference(input, onPartial, onError, onNativeTerminal)
+      },
       cancelInference = { ServerLlmModelHelper.stopResponse(model) },
       recoverConversation = session::recoverConversation,
       onInferenceFinished = {
@@ -222,8 +232,36 @@ class InferenceRunner(
       onCaughtThrowable = { t -> emitDebugStackTrace(t, "execute", model.name) },
       onExecutionReady = cancellationBridge::attach,
       runtimeHealth = runtimeHealth,
+      onGatewayOutcome = completionEvidence::recordGatewayOutcome,
+      onNativeProgress = completionEvidence::recordNativeProgress,
+      onNativeTerminalSignal = completionEvidence::recordNativeSignal,
+      onTimeoutKind = completionEvidence::recordTimeoutKind,
+      watchdogPolicy = watchdogPolicy,
     )
     if (logId != null) RequestLogStore.unregisterCancellation(logId)
+
+    completionEvidence.recordGatewayOutcome(result.gatewayTerminalOutcome)
+    val completionDiagnostic = completionEvidence.snapshot(
+      outputCharCount = result.output?.length ?: 0,
+      outputTokenCount = estimateTokensLongByLength(result.output?.length ?: 0),
+      outputTokenCountSource = OutputTokenCountSource.ESTIMATED,
+      effectiveMaxOutputTokens = effectiveOutputTokens,
+      engineContextTokens = model.engineContextTokens,
+      modelMaxContextTokens = model.modelMaxContextTokens ?: 0,
+      usableInputTokens = model.engineUsableInputTokens,
+      safetyReserveTokens = model.engineSafetyReserveTokens,
+       timeoutConfiguredMs = watchdogPolicy.idleProgressTimeoutMs,
+       firstProgressTimeoutMs = watchdogPolicy.firstProgressTimeoutMs,
+       idleProgressTimeoutMs = watchdogPolicy.idleProgressTimeoutMs,
+      backend = ServerMetrics.activeAccelerator.value,
+      nativeContextBefore = nativeContextBefore,
+      nativeContextAfter = ServerLlmModelHelper.getConversationTokenCount(model),
+      contextCompacted = false,
+    )
+    if (completionDiagnostic != null) {
+      if (logId != null) RequestLogStore.update(logId) { it.copy(completionDiagnostic = completionDiagnostic) }
+      Log.i(TAG, completionDiagnosticMarker(requestId, model.name, completionDiagnostic))
+    }
 
     val nativeCalls = session.capturedNativeToolCalls.get()
     if (nativeCalls != null && nativeCalls.isNotEmpty() && onNativeToolCalls != null) {
@@ -247,7 +285,7 @@ class InferenceRunner(
       // Rough token estimate: ~4 chars per token
       val inputTokens = estimateTokensLong(prompt)
       val outputTokens = estimateTokensLongByLength(outputLen)
-      val maxCtx = model.configValues.maxTokensLong() ?: 0L
+      val maxCtx = model.maxContextTokens?.toLong() ?: 0L
       ServerMetrics.addTokens(outputTokens)
       ServerMetrics.recordLatency(result.totalMs)
       ServerMetrics.recordTtfb(result.ttfbMs)

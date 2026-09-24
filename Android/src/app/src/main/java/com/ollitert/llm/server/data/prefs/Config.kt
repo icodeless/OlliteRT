@@ -38,10 +38,12 @@ data class ConfigKey(val id: String, val label: String, @param:StringRes val lab
 
 object ConfigKeys {
   val MAX_TOKENS = ConfigKey("max_tokens", "Max tokens", R.string.config_label_max_tokens)
+  val MAX_CONTEXT_LENGTH = ConfigKey("max_context_length", "Max context length", R.string.config_label_max_tokens)
   val TOPK = ConfigKey("topk", "TopK", R.string.config_label_topk)
   val TOPP = ConfigKey("topp", "TopP", R.string.config_label_topp)
   val TEMPERATURE = ConfigKey("temperature", "Temperature", R.string.config_label_temperature)
   val DEFAULT_MAX_TOKENS = ConfigKey("default_max_tokens", "Default max tokens", R.string.config_label_default_max_tokens)
+  val DEFAULT_MAX_CONTEXT_TOKENS = ConfigKey("default_max_context_tokens", "Default max context", R.string.config_label_default_max_context_tokens)
   val DEFAULT_TOPK = ConfigKey("default_topk", "Default TopK", R.string.config_label_default_topk)
   val DEFAULT_TOPP = ConfigKey("default_topp", "Default TopP", R.string.config_label_default_topp)
   val DEFAULT_TEMPERATURE = ConfigKey("default_temperature", "Default temperature", R.string.config_label_default_temperature)
@@ -66,13 +68,21 @@ object ConfigKeys {
 /** Internal per-request sampler key. Not persisted or shown in model settings. */
 const val SAMPLER_SEED_CONFIG_KEY = "seed"
 
-/** Read [ConfigKeys.MAX_TOKENS] from a config values map as [Int], or null if absent/non-numeric. */
+/** Read the maximum generated output tokens from a config values map. */
 fun Map<String, Any>.maxTokensInt(): Int? =
   (this[ConfigKeys.MAX_TOKENS.id] as? Number)?.toInt()
 
-/** Read [ConfigKeys.MAX_TOKENS] from a config values map as [Long], or null if absent/non-numeric. */
+/** Read the maximum generated output tokens from a config values map as [Long]. */
 fun Map<String, Any>.maxTokensLong(): Long? =
   (this[ConfigKeys.MAX_TOKENS.id] as? Number)?.toLong()
+
+/** Read the model-declared context capacity from a config values map. */
+fun Map<String, Any>.maxContextLengthInt(): Int? =
+  (this[ConfigKeys.MAX_CONTEXT_LENGTH.id] as? Number)?.toInt()
+
+/** Read the model-declared context capacity from a config values map as [Long]. */
+fun Map<String, Any>.maxContextLengthLong(): Long? =
+  (this[ConfigKeys.MAX_CONTEXT_LENGTH.id] as? Number)?.toLong()
 
 /** Read [ConfigKeys.TEMPERATURE] as [Float], or null if absent/non-numeric. */
 fun Map<String, Any>.configTemperature(): Float? =
@@ -243,7 +253,6 @@ fun preferredAcceleratorOrder(acc: Accelerator): Int = when (acc) {
 
 fun createLlmChatConfigs(
   defaultMaxToken: Int = DEFAULT_MAX_TOKEN,
-  defaultMaxContextLength: Int? = null,
   defaultTopK: Int = DEFAULT_TOPK,
   defaultTopP: Float = DEFAULT_TOPP,
   defaultTemperature: Float = DEFAULT_TEMPERATURE,
@@ -251,18 +260,13 @@ fun createLlmChatConfigs(
   supportThinking: Boolean = false,
   supportSpeculativeDecoding: Boolean = false,
 ): List<Config> {
-  var maxTokensConfig: Config =
-    LabelConfig(key = ConfigKeys.MAX_TOKENS, defaultValue = "$defaultMaxToken")
-  if (defaultMaxContextLength != null) {
-    maxTokensConfig =
-      NumberSliderConfig(
-        key = ConfigKeys.MAX_TOKENS,
-        sliderMin = MIN_MAX_TOKENS.toFloat(),
-        sliderMax = defaultMaxContextLength.toFloat(),
-        defaultValue = defaultMaxToken.toFloat(),
-        valueType = ValueType.INT,
-      )
-  }
+  val maxTokensConfig: Config = NumberSliderConfig(
+    key = ConfigKeys.MAX_TOKENS,
+    sliderMin = MIN_MAX_TOKENS.toFloat(),
+    sliderMax = maxOf(MIN_MAX_TOKENS, defaultMaxToken).toFloat(),
+    defaultValue = defaultMaxToken.toFloat(),
+    valueType = ValueType.INT,
+  )
   val configs =
     listOf(
         maxTokensConfig,

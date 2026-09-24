@@ -156,6 +156,10 @@ object ServerMetrics {
   private val _lastContextUtilization = sessionFlow(0.0)
   val lastContextUtilization: StateFlow<Double> = _lastContextUtilization.asStateFlow()
 
+  /** Native LiteRT-LM conversation token count after the last completed local turn. */
+  private val _lastNativeContextTokens = sessionFlow(0L)
+  val lastNativeContextTokens: StateFlow<Long> = _lastNativeContextTokens.asStateFlow()
+
   // Cumulative timing counters for Prometheus /metrics endpoint (mirrors llama.cpp approach).
   // These track total wall-clock time spent in prefill and decode phases across all requests.
   private val _totalPrefillMs = sessionAtomic()
@@ -486,6 +490,10 @@ object ServerMetrics {
     if (maxContextTokens > 0 && inputTokens > 0) {
       _lastContextUtilization.value = (inputTokens.toDouble() / maxContextTokens.toDouble()) * 100.0
     }
+  }
+
+  fun recordNativeContextTokens(tokens: Long) {
+    _lastNativeContextTokens.value = tokens.coerceAtLeast(0L)
   }
 
   fun onInferenceStarted() {

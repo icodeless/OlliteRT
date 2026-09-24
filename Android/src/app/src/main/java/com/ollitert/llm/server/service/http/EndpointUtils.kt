@@ -36,7 +36,7 @@ import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.repository.RequestLogStore
 import com.ollitert.llm.server.data.prefs.RequestPrefsSnapshot
 import com.ollitert.llm.server.data.prefs.SAMPLER_SEED_CONFIG_KEY
-import com.ollitert.llm.server.data.model.maxContextTokens
+import com.ollitert.llm.server.data.prefs.maxTokensInt
 import com.ollitert.llm.server.runtime.LlmModelInstance
 import com.ollitert.llm.server.service.inference.InferenceRunner
 import com.ollitert.llm.server.service.inference.PromptCompactor
@@ -159,8 +159,13 @@ internal fun buildPerRequestConfig(
   seed?.let { overridden[SAMPLER_SEED_CONFIG_KEY] = it }
   maxTokens?.let {
     val clamped = clampMaxTokens(it)
-    val engineMax = model.maxContextTokens
-    overridden[ConfigKeys.MAX_TOKENS.id] = if (engineMax != null) clamped.coerceAtMost(engineMax) else clamped
+    // max_tokens is an output-generation limit. It must not be clamped against
+    // EngineConfig.maxNumTokens, which is the combined input/output KV-cache capacity.
+    val configuredMaxOutput = model.configValues.maxTokensInt()?.takeIf { value -> value > 0 }
+      ?: model.llmMaxToken.takeIf { value -> value > 0 }
+    overridden[ConfigKeys.MAX_TOKENS.id] = configuredMaxOutput?.let { limit ->
+      clamped.coerceAtMost(limit)
+    } ?: clamped
   }
   return overridden.toMap()
 }

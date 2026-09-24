@@ -89,6 +89,9 @@ internal class ConversationDispatchSession(
   /** Native tool calls captured during inference when schema injection is active. */
   val capturedNativeToolCalls = AtomicReference<List<com.google.ai.edge.litertlm.ToolCall>?>(null)
 
+  /** First native terminal callback observed for this request; unavailable until dispatch. */
+  val nativeTerminalSignal = AtomicReference(NativeTerminalSignal.UNAVAILABLE)
+
   private var originalConfig: Map<String, Any>? = null
   var preparedIncrementalUserText: String? = incrementalUserText
     private set
@@ -146,6 +149,7 @@ internal class ConversationDispatchSession(
     input: String,
     onPartial: (partial: String, done: Boolean, thought: String?) -> Unit,
     onError: (message: String) -> Unit,
+    onNativeTerminalSignal: (NativeTerminalSignal) -> Unit = {},
   ) {
     ServerLlmModelHelper.runInference(
       model = model,
@@ -165,6 +169,10 @@ internal class ConversationDispatchSession(
       thinkingConfig = sdkThinkingConfig,
       repetitionPenaltyConfig = sdkRepetitionPenaltyConfig,
       maxOutputToken = maxOutputToken,
+      onNativeTerminalSignal = { signal ->
+        nativeTerminalSignal.compareAndSet(NativeTerminalSignal.UNAVAILABLE, signal)
+        onNativeTerminalSignal(signal)
+      },
     )
   }
 

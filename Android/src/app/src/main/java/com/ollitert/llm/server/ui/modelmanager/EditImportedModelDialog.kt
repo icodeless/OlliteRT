@@ -124,6 +124,10 @@ fun EditImportedModelDialog(
       for (config in editConfigs) put(config.key.id, config.defaultValue)
       existingModel.llmConfig?.let { cfg ->
         put(ConfigKeys.DEFAULT_MAX_TOKENS.id, cfg.defaultMaxTokens.toFloat())
+        put(
+          ConfigKeys.DEFAULT_MAX_CONTEXT_TOKENS.id,
+          (cfg.defaultMaxContextTokens.takeIf { it > 0 } ?: 8192).toFloat(),
+        )
         put(ConfigKeys.DEFAULT_TOPK.id, cfg.defaultTopk.toFloat())
         put(ConfigKeys.DEFAULT_TOPP.id, cfg.defaultTopp)
         put(ConfigKeys.DEFAULT_TEMPERATURE.id, cfg.defaultTemperature)
@@ -278,6 +282,7 @@ fun EditImportedModelDialog(
                 values, ConfigKeys.COMPATIBLE_ACCELERATORS, ValueType.STRING, SUPPORTED_ACCELERATORS[0].label
               ).split(",")
               val defaultMaxTokens = safeConfigValue(values, ConfigKeys.DEFAULT_MAX_TOKENS, ValueType.INT, DEFAULT_MAX_TOKEN)
+              val defaultMaxContextTokens = safeConfigValue(values, ConfigKeys.DEFAULT_MAX_CONTEXT_TOKENS, ValueType.INT, 8192)
               val defaultTopk = safeConfigValue(values, ConfigKeys.DEFAULT_TOPK, ValueType.INT, DEFAULT_TOPK)
               val defaultTopp = safeConfigValue(values, ConfigKeys.DEFAULT_TOPP, ValueType.FLOAT, DEFAULT_TOPP)
               val defaultTemperature = safeConfigValue(values, ConfigKeys.DEFAULT_TEMPERATURE, ValueType.FLOAT, DEFAULT_TEMPERATURE)
@@ -294,6 +299,7 @@ fun EditImportedModelDialog(
                   LlmConfig.newBuilder()
                     .addAllCompatibleAccelerators(supportedAccelerators)
                     .setDefaultMaxTokens(defaultMaxTokens)
+                    .setDefaultMaxContextTokens(defaultMaxContextTokens)
                     .setDefaultTopk(defaultTopk)
                     .setDefaultTopp(defaultTopp)
                     .setDefaultTemperature(defaultTemperature)

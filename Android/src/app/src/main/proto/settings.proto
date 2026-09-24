@@ -45,6 +45,8 @@ message LlmConfig {
   bool support_thinking = 10;
   bool support_tools = 11;
   bool support_speculative_decoding = 12;
+  // Input + output context capacity, independent from default_max_tokens.
+  int32 default_max_context_tokens = 13;
 }
 
 message RepositoryEntry {

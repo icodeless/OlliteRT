@@ -25,10 +25,12 @@ import com.ollitert.llm.server.data.model.EventCategory
 import com.ollitert.llm.server.data.prefs.LOG_STREAMING_PREVIEW_DEBOUNCE_MS
 import com.ollitert.llm.server.data.model.LogLevel
 import com.ollitert.llm.server.data.model.Model
+import com.ollitert.llm.server.data.model.maxContextTokens
+import com.ollitert.llm.server.data.model.modelMaxContextTokens
 import com.ollitert.llm.server.data.repository.RequestLogStore
+import com.ollitert.llm.server.runtime.ServerLlmModelHelper
 import com.ollitert.llm.server.data.prefs.RequestPrefsSnapshot
 import com.ollitert.llm.server.data.prefs.maxTokensInt
-import com.ollitert.llm.server.data.prefs.maxTokensLong
 import com.ollitert.llm.server.common.ErrorSuggestions
 import com.ollitert.llm.server.service.formats.StreamingFormat
 import com.ollitert.llm.server.service.http.ResponseRenderer
@@ -62,6 +64,10 @@ internal class StreamState(
   val keepPartial: Boolean,
   val inferenceControl: AtomicReference<InferenceGateway.InferenceControl?>,
   val onConversationFinished: (Boolean, String?) -> Unit,
+  val completionEvidence: InferenceCompletionEvidence,
+  val nativeContextBefore: Long,
+  val effectiveMaxOutputTokens: Int,
+  val watchdogPolicy: InferenceWatchdogPolicy,
   val onLogEvent: (String) -> Unit = {},
 ) {
   val fullText = StringBuilder()
@@ -134,6 +140,7 @@ internal class StreamState(
   }
 
   fun logCancellation() {
+    completionEvidence.recordGatewayOutcome(GatewayTerminalOutcome.CANCELLED)
     if (logId != null) {
       RequestLogStore.unregisterCancellation(logId)
       RequestLogStore.update(logId) {
@@ -146,10 +153,40 @@ internal class StreamState(
         )
       }
     }
+    recordCompletionDiagnostic(fullText.length)
     onLogEvent("request_cancelled id=$requestId endpoint=$endpoint streaming=true outputChars=${fullText.length}")
   }
 
   fun elapsedMs(): Long = SystemClock.elapsedRealtime() - streamStartMs
+
+  /** Persists one bounded termination snapshot and emits one content-free marker. */
+  fun recordCompletionDiagnostic(outputChars: Int) {
+    val diagnostic = completionEvidence.snapshot(
+      outputCharCount = outputChars,
+      outputTokenCount = estimateTokensLongByLength(outputChars),
+      outputTokenCountSource = OutputTokenCountSource.ESTIMATED,
+      effectiveMaxOutputTokens = effectiveMaxOutputTokens,
+      engineContextTokens = model.engineContextTokens,
+      modelMaxContextTokens = model.modelMaxContextTokens ?: 0,
+      usableInputTokens = model.engineUsableInputTokens,
+      safetyReserveTokens = model.engineSafetyReserveTokens,
+       timeoutConfiguredMs = watchdogPolicy.idleProgressTimeoutMs,
+       firstProgressTimeoutMs = watchdogPolicy.firstProgressTimeoutMs,
+       idleProgressTimeoutMs = watchdogPolicy.idleProgressTimeoutMs,
+      backend = ServerMetrics.activeAccelerator.value,
+      nativeContextBefore = nativeContextBefore,
+      nativeContextAfter = ServerLlmModelHelper.getConversationTokenCount(model),
+      contextCompacted = logId?.let { id -> RequestLogStore.entries.value.firstOrNull { it.id == id }?.isCompacted } == true,
+    ) ?: return
+    if (logId != null) {
+      RequestLogStore.update(logId) { it.copy(completionDiagnostic = diagnostic) }
+    }
+    Log.i(TAG, completionDiagnosticMarker(requestId, model.name, diagnostic))
+  }
+
+  fun ensureCompletionDiagnostic() {
+    recordCompletionDiagnostic(fullText.length)
+  }
 
   // Incremental stop-sequence scanner state — see [InferenceStopCondition.IncrementalStopMatcher].
   // Re-scanning (and copying) the full generated text on every token is O(n²)
@@ -240,6 +277,7 @@ internal class StreamState(
     channel: Channel<StreamEvent>,
     capturedNativeToolCalls: AtomicReference<List<com.google.ai.edge.litertlm.ToolCall>?>,
   ) {
+    completionEvidence.recordChunk(event.partial.isNotEmpty() || !event.thought.isNullOrEmpty())
     if (firstTokenMs == 0L && (event.partial.isNotEmpty() || !event.thought.isNullOrEmpty())) {
       firstTokenMs = SystemClock.elapsedRealtime()
     }
@@ -262,7 +300,7 @@ internal class StreamState(
     val outputTokens = estimateTokensLongByLength(outputLen)
     val totalLatencyMs = elapsedMs()
     val ttfbMs = if (firstTokenMs > 0) firstTokenMs - streamStartMs else 0L
-    val maxCtx = model.configValues.maxTokensLong() ?: 0L
+    val maxCtx = model.maxContextTokens?.toLong() ?: 0L
     ServerMetrics.addTokens(outputTokens)
     ServerMetrics.recordLatency(totalLatencyMs)
     ServerMetrics.recordTtfb(ttfbMs)
@@ -317,7 +355,7 @@ internal class StreamState(
       RequestLogStore.update(logId) {
         it.copy(
           responseBody = responseJson,
-          partialText = null,
+           partialText = null,
           isPending = false,
           latencyMs = totalLatencyMs,
           isThinking = ServerMetrics.thinkingEnabled.value,
@@ -329,6 +367,7 @@ internal class StreamState(
         )
       }
     }
+    recordCompletionDiagnostic(outputLen)
     onLogEvent("request_done id=$requestId endpoint=$endpoint streaming=true totalMs=$totalLatencyMs ttfbMs=$ttfbMs outputChars=$outputLen${format.buildLogEventSuffix(parsedToolCalls)}")
     finishConversation(
       isReusable = !stopSequenceTriggered,
@@ -355,7 +394,7 @@ internal class StreamState(
       val actualTokens = InferenceMetricsCollector.extractActualTokenCounts(error)
       RequestLogStore.update(logId) {
         it.copy(
-          partialText = null,
+           partialText = buildCancelledPartial(),
           responseBody = logErrorJson,
           isPending = false,
           latencyMs = elapsedMs(),
@@ -367,6 +406,7 @@ internal class StreamState(
         )
       }
     }
+    recordCompletionDiagnostic(fullText.length)
     try {
       format.emitError(writer, enrichedError, suggestion, kind, oaiErrorJson, headerWritten)
       writer.finish()

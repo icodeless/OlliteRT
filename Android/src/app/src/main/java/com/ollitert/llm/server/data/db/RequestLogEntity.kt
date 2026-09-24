@@ -25,6 +25,7 @@ import com.ollitert.llm.server.data.model.ErrorKind
 import com.ollitert.llm.server.data.model.EventCategory
 import com.ollitert.llm.server.data.model.LogLevel
 import com.ollitert.llm.server.data.model.RequestLogEntry
+import com.ollitert.llm.server.service.inference.InferenceCompletionDiagnostic
 import android.util.Log
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -97,6 +98,7 @@ data class RequestLogEntity(
     val decodeSpeed: Double = 0.0,
     val prefillSpeed: Double = 0.0,
     val itlMs: Double = 0.0,
+    val completionDiagnostic: InferenceCompletionDiagnostic? = null,
   )
 
   /** Convert back to the in-memory [RequestLogEntry]. */
@@ -176,6 +178,7 @@ data class RequestLogEntity(
       decodeSpeed = ext.decodeSpeed,
       prefillSpeed = ext.prefillSpeed,
       itlMs = ext.itlMs,
+      completionDiagnostic = ext.completionDiagnostic,
     )
   }
 
@@ -207,6 +210,7 @@ data class RequestLogEntity(
         decodeSpeed = entry.decodeSpeed,
         prefillSpeed = entry.prefillSpeed,
         itlMs = entry.itlMs,
+        completionDiagnostic = entry.completionDiagnostic,
       )
       return RequestLogEntity(
         id = entry.id,

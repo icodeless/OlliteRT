@@ -214,7 +214,6 @@ data class AllowedModel(
             defaultTopP = defaultTopP,
             defaultTemperature = defaultTemperature,
             defaultMaxToken = llmMaxToken,
-            defaultMaxContextLength = llmMaxContextLength,
             accelerators = accelerators,
             supportThinking = llmSupportThinking == true,
             supportSpeculativeDecoding = llmSupportSpeculativeDecoding == true,
@@ -246,6 +245,7 @@ data class AllowedModel(
         if (llmSupportSpeculativeDecoding == true) add(ModelCapability.SPECULATIVE_DECODING)
       },
       llmMaxToken = llmMaxToken,
+      declaredMaxContextTokens = llmMaxContextLength,
       accelerators = accelerators,
       visionAccelerator = visionAccelerator,
       badge = badge?.let { ModelBadge.fromKey(it) },

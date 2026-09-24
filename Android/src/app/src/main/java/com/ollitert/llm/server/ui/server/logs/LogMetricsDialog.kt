@@ -98,6 +98,34 @@ internal fun RequestMetricsDialog(entry: RequestLogEntry, onDismiss: () -> Unit)
             },
           )
         }
+        entry.completionDiagnostic?.let { diagnostic ->
+          Spacer(modifier = Modifier.height(4.dp))
+          Text(
+            text = "Termination evidence",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+          )
+          MetricsRow("Native signal", diagnostic.nativeTerminalSignal.name)
+          MetricsRow("Gateway outcome", diagnostic.gatewayTerminalOutcome.name)
+          MetricsRow("SDK finish reason", diagnostic.sdkFinishReason ?: "Unavailable")
+          MetricsRow("Output token source", diagnostic.outputTokenCountSource.name)
+          MetricsRow("Output-limit evidence", diagnostic.outputLimitEvidence.name)
+          if (diagnostic.effectiveMaxOutputTokens > 0) {
+            MetricsRow("Effective max output", diagnostic.effectiveMaxOutputTokens.toString())
+          }
+          if (diagnostic.nativeContextBefore > 0 || diagnostic.nativeContextAfter > 0) {
+            MetricsRow(
+              "Native context",
+              "${diagnostic.nativeContextBefore} → ${diagnostic.nativeContextAfter}",
+            )
+          }
+          if (diagnostic.streamChunkCount > 0) {
+            MetricsRow("Stream chunks", diagnostic.streamChunkCount.toString())
+          }
+          if (diagnostic.lastChunkToDoneMs > 0) {
+            MetricsRow("Last chunk → done", "${diagnostic.lastChunkToDoneMs} ms")
+          }
+        }
       }
     },
     confirmButton = {

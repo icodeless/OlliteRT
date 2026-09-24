@@ -98,9 +98,15 @@ suspend fun ApplicationCall.respondHttpResponse(resp: HttpResponse) {
     is HttpResponse.Sse -> {
       respondTextWriter(contentType = ContentType.Text.EventStream) {
         kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-          kotlinx.coroutines.withTimeout(resp.outerTimeoutMs) {
+          val writeResponse: suspend () -> Unit = {
             val writer = KtorSseWriterImpl(this@respondTextWriter)
             resp.writer(writer)
+          }
+          val outerTimeoutMs = resp.outerTimeoutMs
+          if (outerTimeoutMs == null) {
+            writeResponse()
+          } else {
+            kotlinx.coroutines.withTimeout(outerTimeoutMs) { writeResponse() }
           }
         }
       }

@@ -60,6 +60,8 @@ class ServerControlHandler(
   private val serviceContext: Context,
   private val modelLifecycle: ModelLifecycle,
   private val inferenceLock: Any,
+  private val onServerStop: (() -> Unit)? = null,
+  private val onServerReload: ((port: Int, modelName: String) -> Unit)? = null,
 ) {
 
   private val behaviorToggles = listOf(
@@ -80,10 +82,14 @@ class ServerControlHandler(
    * Handles POST /v1/server/stop — triggers graceful shutdown via the service Stop action.
    */
   fun handleServerStop(): HttpResponse {
-    val stopIntent = Intent(serviceContext, ServerService::class.java).apply {
-      action = ServerService.ACTION_STOP
-    }
     return try {
+      if (onServerStop != null) {
+        onServerStop.invoke()
+        return httpOkJson("""{"success":true,"message":"Server stopping"}""")
+      }
+      val stopIntent = Intent(serviceContext, Class.forName("com.ollitert.llm.server.service.ServerService")).apply {
+        action = "com.ollitert.llm.server.ACTION_STOP"
+      }
       serviceContext.startService(stopIntent)
       httpOkJson("""{"success":true,"message":"Server stopping"}""")
     } catch (e: Exception) {
@@ -99,7 +105,17 @@ class ServerControlHandler(
     val modelName = defaultModel?.name ?: keepAliveUnloadedModelName
       ?: return httpBadRequest("No model loaded")
     val reloadPort = ServerMetrics.port.value
-    ServerService.reload(serviceContext, reloadPort, modelName)
+    if (onServerReload != null) {
+      onServerReload.invoke(reloadPort, modelName)
+    } else {
+      try {
+        val clazz = Class.forName("com.ollitert.llm.server.service.ServerService")
+        val method = clazz.getMethod("reload", Context::class.java, Int::class.javaPrimitiveType, String::class.java)
+        method.invoke(null, serviceContext, reloadPort, modelName)
+      } catch (e: Exception) {
+        Log.w(TAG, "Dynamic ServerService reload failed", e)
+      }
+    }
     val result = buildJsonObject {
       put("success", true)
       put("message", "Model reloading")

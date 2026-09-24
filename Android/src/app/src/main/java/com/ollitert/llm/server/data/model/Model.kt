@@ -22,6 +22,7 @@ import com.ollitert.llm.server.data.prefs.ValueType
 import com.ollitert.llm.server.data.prefs.configSpeculativeDecodingEnabled
 import com.ollitert.llm.server.data.prefs.configThinkingEnabled
 import com.ollitert.llm.server.data.prefs.convertValueToTargetType
+import com.ollitert.llm.server.data.prefs.maxContextLengthInt
 import com.ollitert.llm.server.data.prefs.maxTokensInt
 
 import android.content.Context
@@ -221,6 +222,9 @@ data class Model(
   /** The max token for llm model. */
   val llmMaxToken: Int = 0,
 
+  /** Immutable model-declared input+output context capacity. */
+  val declaredMaxContextTokens: Int? = null,
+
   /** Compatible accelerators. */
   val accelerators: List<Accelerator> = listOf(),
 
@@ -257,6 +261,16 @@ data class Model(
   @Volatile var instance: Any? = null,
   @Volatile var initializedWithVision: Boolean = false,
   @Volatile var configValues: Map<String, Any> = mapOf(),
+  /** Effective EngineConfig.maxNumTokens for the currently initialized engine. */
+  @Volatile var engineContextTokens: Int = 0,
+  /** How the current engine context was selected: probed, cached, or fallback. */
+  @Volatile var engineContextSource: String = "unknown",
+  /** Effective output ceiling selected alongside the current engine allocation. */
+  @Volatile var engineMaxOutputTokens: Int = 0,
+  /** Safety reserve used by the current engine allocation. */
+  @Volatile var engineSafetyReserveTokens: Int = 0,
+  /** Input budget derived from the current engine allocation tuple. */
+  @Volatile var engineUsableInputTokens: Int = 0,
   var totalBytes: Long = 0L,
   var accessToken: String? = null,
 
@@ -352,9 +366,20 @@ val Model.llmSupportThinking: Boolean get() = ModelCapability.THINKING in capabi
 val Model.llmSupportsNpu: Boolean get() = ModelCapability.NPU in capabilities
 val Model.llmSupportSpeculativeDecoding: Boolean get() = ModelCapability.SPECULATIVE_DECODING in capabilities
 
-/** Max context tokens from the model's live [configValues], or null if not configured. */
+/** Immutable model capability, with compatibility fallback for older/imported models. */
+val Model.modelMaxContextTokens: Int?
+  get() = declaredMaxContextTokens
+    ?: configValues.maxContextLengthInt()
+
+/** Effective output ceiling for the currently initialized engine. */
+val Model.effectiveMaxOutputTokens: Int
+  get() = engineMaxOutputTokens.takeIf { it > 0 }
+    ?: configValues.maxTokensInt()
+    ?: llmMaxToken.coerceAtLeast(0)
+
+/** Effective context capacity of the initialized engine, or the model capability before load. */
 val Model.maxContextTokens: Int?
-  get() = configValues.maxTokensInt()
+  get() = engineContextTokens.takeIf { it > 0 } ?: modelMaxContextTokens
 
 /** Whether thinking is both supported by the model and enabled in the current config. */
 val Model.isThinkingEnabled: Boolean

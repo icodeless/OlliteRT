@@ -22,6 +22,7 @@ import com.ollitert.llm.server.service.inference.*
 import com.ollitert.llm.server.service.http.*
 
 import android.util.Log
+import android.os.SystemClock
 import com.ollitert.llm.server.data.prefs.BLOCKING_TIMEOUT_SECONDS
 import com.ollitert.llm.server.data.prefs.STREAMING_TIMEOUT_SECONDS
 import kotlinx.coroutines.CancellationException
@@ -31,7 +32,9 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class InferenceResult(
   val output: String?,
@@ -39,12 +42,21 @@ data class InferenceResult(
   val error: String?,
   val totalMs: Long,
   val ttfbMs: Long,
+  val gatewayTerminalOutcome: GatewayTerminalOutcome = GatewayTerminalOutcome.UNAVAILABLE,
 )
 
 typealias InferenceFn = (
   prompt: String,
   onPartial: (partial: String, done: Boolean, thought: String?) -> Unit,
   onError: (message: String) -> Unit,
+) -> Unit
+
+/** Inference callback with the native terminal signal preserved as a separate channel. */
+typealias DiagnosticInferenceFn = (
+  prompt: String,
+  onPartial: (partial: String, done: Boolean, thought: String?) -> Unit,
+  onError: (message: String) -> Unit,
+  onNativeTerminalSignal: (NativeTerminalSignal) -> Unit,
 ) -> Unit
 
 private const val TAG = "OlliteRT.Gateway"
@@ -78,6 +90,11 @@ object InferenceGateway {
       Thread(task, "OlliteRT-CancelSettlement").apply { isDaemon = true }
     }
 
+  private val progressWatchdogMonitor =
+    Executors.newSingleThreadScheduledExecutor { task ->
+      Thread(task, "OlliteRT-ProgressWatchdog").apply { isDaemon = true }
+    }
+
   internal enum class CancellationReason {
     CALLER,
     EXTERNAL,
@@ -94,7 +111,7 @@ object InferenceGateway {
   private sealed interface ExecutionOutcome {
     data object Success : ExecutionOutcome
     data object Stopped : ExecutionOutcome
-    data object Timeout : ExecutionOutcome
+    data class Timeout(val kind: TimeoutKind) : ExecutionOutcome
     data class Cancelled(val reason: CancellationReason) : ExecutionOutcome
     data class Error(val message: String) : ExecutionOutcome
   }
@@ -106,6 +123,14 @@ object InferenceGateway {
     RUNNING,
     SETTLING,
     FINISHED,
+  }
+
+  private fun gatewayOutcome(outcome: ExecutionOutcome): GatewayTerminalOutcome = when (outcome) {
+    ExecutionOutcome.Success -> GatewayTerminalOutcome.SUCCESS
+    ExecutionOutcome.Stopped -> GatewayTerminalOutcome.STOPPED
+    is ExecutionOutcome.Timeout -> GatewayTerminalOutcome.TIMEOUT
+    is ExecutionOutcome.Cancelled -> GatewayTerminalOutcome.CANCELLED
+    is ExecutionOutcome.Error -> GatewayTerminalOutcome.ERROR
   }
 
   /** Owns native-dispatch and terminal-state decisions for one request. */
@@ -120,6 +145,9 @@ object InferenceGateway {
     private var outcome: ExecutionOutcome? = null
     private var nativeDispatched = false
     private var nativeCancellationStarted = false
+    private var pendingProgressAtMs = 0L
+    private var progressWatchdog: InferenceProgressWatchdog? = null
+    private var progressWatchdogFuture: ScheduledFuture<*>? = null
 
     override fun cancel(reason: CancellationReason): Boolean {
       var settledBeforeDispatch = false
@@ -167,11 +195,52 @@ object InferenceGateway {
       true
     }
 
-    fun awaitTerminal(timeoutSeconds: Long): ExecutionOutcome {
-      if (!terminalSignal.await(timeoutSeconds, TimeUnit.SECONDS)) {
-        complete(ExecutionOutcome.Timeout)
-      }
+    fun awaitTerminal(): ExecutionOutcome {
+      terminalSignal.await()
       return synchronized(stateLock) { requireNotNull(outcome) }
+    }
+
+    /** Legacy source compatibility only; timeoutSeconds is no longer a total deadline. */
+    @Deprecated("Inference uses the progress-aware watchdog")
+    fun awaitTerminal(@Suppress("UNUSED_PARAMETER") timeoutSeconds: Long): ExecutionOutcome = awaitTerminal()
+
+    fun startProgressWatchdog(policy: InferenceWatchdogPolicy) {
+      synchronized(stateLock) {
+        if (outcome != null || phase == ExecutionPhase.FINISHED || progressWatchdog != null) return
+        val watchdog = InferenceProgressWatchdog(policy) { SystemClock.elapsedRealtime() }
+        progressWatchdog = watchdog
+        if (pendingProgressAtMs > 0L) watchdog.noteProgress(pendingProgressAtMs)
+        val tickMs = minOf(
+          1_000L,
+          maxOf(50L, minOf(policy.firstProgressTimeoutMs, policy.idleProgressTimeoutMs) / 4L),
+        )
+        progressWatchdogFuture = progressWatchdogMonitor.scheduleAtFixedRate(
+          {
+            val kind = watchdog.timeoutKind()
+            if (kind != TimeoutKind.NONE && complete(ExecutionOutcome.Timeout(kind))) {
+              Log.w(TAG, "Inference watchdog timeout kind=$kind")
+            }
+          },
+          tickMs,
+          tickMs,
+          TimeUnit.MILLISECONDS,
+        )
+      }
+    }
+
+    /** Native progress is recorded before any UI/HTTP consumer callback. */
+    fun noteNativeProgress(): Boolean = synchronized(stateLock) {
+      if (outcome != null || phase == ExecutionPhase.FINISHED) return@synchronized false
+      val now = SystemClock.elapsedRealtime()
+      val watchdog = progressWatchdog
+      if (watchdog == null) pendingProgressAtMs = now else watchdog.noteProgress(now)
+      true
+    }
+
+    private fun stopProgressWatchdog() {
+      progressWatchdogFuture?.cancel(false)
+      progressWatchdogFuture = null
+      progressWatchdog = null
     }
 
     fun settle(
@@ -211,6 +280,7 @@ object InferenceGateway {
       } catch (t: Throwable) {
         onFailure(t)
       } finally {
+        synchronized(stateLock) { stopProgressWatchdog() }
         synchronized(stateLock) { phase = ExecutionPhase.FINISHED }
         settledSignal.countDown()
       }
@@ -250,10 +320,12 @@ object InferenceGateway {
   internal fun executeStreaming(
     prompt: String,
     timeoutSeconds: Long = STREAMING_TIMEOUT_SECONDS,
+    watchdogPolicy: InferenceWatchdogPolicy? = null,
     executor: Executor,
     inferenceLock: Any,
     resetConversation: () -> Unit,
     runInference: InferenceFn,
+    runInferenceWithDiagnostics: DiagnosticInferenceFn? = null,
     cancelInference: () -> Unit,
     recoverConversation: () -> Unit = resetConversation,
     onToken: (partial: String, done: Boolean, thought: String?) -> Unit,
@@ -263,10 +335,37 @@ object InferenceGateway {
     onExecutionReady: ((InferenceControl) -> Unit)? = null,
     runtimeHealth: InferenceRuntimeHealth = InferenceRuntimeHealth(),
     postCancelSettlementTimeoutMs: Long = POST_CANCEL_SETTLEMENT_TIMEOUT_MS,
+    onSettled: () -> Unit = {},
+    onGatewayOutcome: (GatewayTerminalOutcome) -> Unit = {},
+    onNativeProgress: () -> Unit = {},
+    onNativeTerminalSignal: (NativeTerminalSignal) -> Unit = {},
+    onTimeoutKind: (TimeoutKind) -> Unit = {},
   ) {
     val runtimeOwner = Any()
+    val settledOnce = AtomicBoolean(false)
+    val gatewayOutcomeReported = AtomicBoolean(false)
+    val reportGatewayOutcome: (GatewayTerminalOutcome) -> Unit = { outcome ->
+      if (gatewayOutcomeReported.compareAndSet(false, true)) {
+        try {
+          onGatewayOutcome(outcome)
+        } catch (t: Throwable) {
+          reportGatewayFailure(onCaughtThrowable, "Streaming gateway outcome callback failed", t)
+        }
+      }
+    }
+    val notifySettled = {
+      if (settledOnce.compareAndSet(false, true)) {
+        try {
+          onSettled()
+        } catch (t: Throwable) {
+          reportGatewayFailure(onCaughtThrowable, "Streaming onSettled callback failed", t)
+        }
+      }
+    }
     if (!runtimeHealth.tryAdmit(runtimeOwner)) {
+      reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
       onError(INFERENCE_RUNTIME_QUARANTINED_ERROR)
+      notifySettled()
       return
     }
     val execution = RequestExecution(
@@ -275,20 +374,30 @@ object InferenceGateway {
         monitorSettlement(pendingExecution, runtimeHealth, runtimeOwner, postCancelSettlementTimeoutMs)
       },
     )
+    val effectiveWatchdogPolicy = watchdogPolicy
+      ?: InferenceWatchdogPolicy.fromLegacyTimeoutSeconds(timeoutSeconds)
+    val dispatchInference: DiagnosticInferenceFn = runInferenceWithDiagnostics ?: {
+      inferencePrompt, onPartial, onError, _ ->
+      runInference(inferencePrompt, onPartial, onError)
+    }
     onExecutionReady?.invoke(execution)
     try {
       executor.execute {
         synchronized(inferenceLock) {
-          if (!execution.beginPreparation()) {
-            runtimeHealth.markSettled(runtimeOwner)
+           if (!execution.beginPreparation()) {
+             reportGatewayOutcome(GatewayTerminalOutcome.CANCELLED)
+             runtimeHealth.markSettled(runtimeOwner)
+            notifySettled()
             return@synchronized
           }
           val terminal = try {
             resetConversation()
             execution.dispatch {
-              runInference(
+              dispatchInference(
                 prompt,
                 { partial, done, thought ->
+                  val hasNativeProgress = partial.isNotEmpty() || !thought.isNullOrEmpty()
+                  if (hasNativeProgress && execution.noteNativeProgress()) onNativeProgress()
                   if (done) {
                     if (execution.complete(ExecutionOutcome.Success)) {
                       onToken(partial, true, thought)
@@ -298,20 +407,26 @@ object InferenceGateway {
                   }
                 },
                 { message -> execution.complete(ExecutionOutcome.Error(message)) },
+                 onNativeTerminalSignal,
               )
             }
-            execution.awaitTerminal(timeoutSeconds)
+            execution.startProgressWatchdog(effectiveWatchdogPolicy)
+            execution.awaitTerminal()
           } catch (t: Throwable) {
             if (t is OutOfMemoryError) System.gc()
             reportGatewayFailure(onCaughtThrowable, "Streaming inference failed", t)
             execution.complete(ExecutionOutcome.Error(t.message ?: "unknown_error"))
-            execution.awaitTerminal(0)
+            execution.awaitTerminal()
           }
           try {
+            reportGatewayOutcome(gatewayOutcome(terminal))
             when (terminal) {
               ExecutionOutcome.Success -> Unit
               ExecutionOutcome.Stopped -> Unit
-              ExecutionOutcome.Timeout -> onError("timeout")
+               is ExecutionOutcome.Timeout -> {
+                 onTimeoutKind(terminal.kind)
+                 onError("timeout")
+               }
               is ExecutionOutcome.Cancelled -> onError(
                 when (terminal.reason) {
                   CancellationReason.CALLER -> "client_disconnected"
@@ -331,12 +446,14 @@ object InferenceGateway {
               },
             )
             runtimeHealth.markSettled(runtimeOwner)
+            notifySettled()
           }
         }
       }
     } catch (t: Throwable) {
       reportGatewayFailure(onCaughtThrowable, "Streaming executor rejected inference", t)
       execution.complete(ExecutionOutcome.Error("executor_rejected"))
+      reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
       try {
         onError("executor_rejected")
       } catch (callbackFailure: Throwable) {
@@ -350,6 +467,7 @@ object InferenceGateway {
           },
         )
         runtimeHealth.markSettled(runtimeOwner)
+        notifySettled()
       }
     }
   }
@@ -361,10 +479,12 @@ object InferenceGateway {
   internal suspend fun execute(
     prompt: String,
     timeoutSeconds: Long = BLOCKING_TIMEOUT_SECONDS,
+    watchdogPolicy: InferenceWatchdogPolicy? = null,
     executor: Executor,
     inferenceLock: Any,
     resetConversation: () -> Unit,
     runInference: InferenceFn,
+    runInferenceWithDiagnostics: DiagnosticInferenceFn? = null,
     cancelInference: () -> Unit,
     recoverConversation: () -> Unit = resetConversation,
     onInferenceFinished: () -> Unit = {},
@@ -373,19 +493,35 @@ object InferenceGateway {
     onExecutionReady: ((InferenceControl) -> Unit)? = null,
     runtimeHealth: InferenceRuntimeHealth = InferenceRuntimeHealth(),
     postCancelSettlementTimeoutMs: Long = POST_CANCEL_SETTLEMENT_TIMEOUT_MS,
+    onGatewayOutcome: (GatewayTerminalOutcome) -> Unit = {},
+    onNativeProgress: () -> Unit = {},
+    onNativeTerminalSignal: (NativeTerminalSignal) -> Unit = {},
+    onTimeoutKind: (TimeoutKind) -> Unit = {},
   ): InferenceResult {
     val sb = StringBuilder()
     val thinkingSb = StringBuilder()
     val startMs = elapsedMs()
     var firstTokenMs: Long? = null
     val runtimeOwner = Any()
+    val gatewayOutcomeReported = AtomicBoolean(false)
+    val reportGatewayOutcome: (GatewayTerminalOutcome) -> Unit = { outcome ->
+      if (gatewayOutcomeReported.compareAndSet(false, true)) {
+        try {
+          onGatewayOutcome(outcome)
+        } catch (t: Throwable) {
+          reportGatewayFailure(onCaughtThrowable, "Blocking gateway outcome callback failed", t)
+        }
+      }
+    }
     if (!runtimeHealth.tryAdmit(runtimeOwner)) {
+      reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
       return InferenceResult(
         output = null,
         thinking = null,
         error = INFERENCE_RUNTIME_QUARANTINED_ERROR,
         totalMs = elapsedMs() - startMs,
         ttfbMs = -1,
+        gatewayTerminalOutcome = GatewayTerminalOutcome.ERROR,
       )
     }
     val execution = RequestExecution(
@@ -394,21 +530,30 @@ object InferenceGateway {
         monitorSettlement(pendingExecution, runtimeHealth, runtimeOwner, postCancelSettlementTimeoutMs)
       },
     )
+    val effectiveWatchdogPolicy = watchdogPolicy
+      ?: InferenceWatchdogPolicy.fromLegacyTimeoutSeconds(timeoutSeconds)
+    val dispatchInference: DiagnosticInferenceFn = runInferenceWithDiagnostics ?: {
+      inferencePrompt, onPartial, onError, _ ->
+      runInference(inferencePrompt, onPartial, onError)
+    }
     onExecutionReady?.invoke(execution)
 
     try {
       executor.execute {
         synchronized(inferenceLock) {
-          if (!execution.beginPreparation()) {
-            runtimeHealth.markSettled(runtimeOwner)
+           if (!execution.beginPreparation()) {
+             reportGatewayOutcome(GatewayTerminalOutcome.CANCELLED)
+             runtimeHealth.markSettled(runtimeOwner)
             return@synchronized
           }
           try {
             resetConversation()
             execution.dispatch {
-              runInference(
+              dispatchInference(
                 prompt,
                 { partial, done, thought ->
+                  val hasNativeProgress = partial.isNotEmpty() || !thought.isNullOrEmpty()
+                  if (hasNativeProgress && execution.noteNativeProgress()) onNativeProgress()
                   if (partial.isNotEmpty()) {
                     if (firstTokenMs == null) {
                       firstTokenMs = elapsedMs() - startMs
@@ -421,9 +566,11 @@ object InferenceGateway {
                   if (done) execution.complete(ExecutionOutcome.Success)
                 },
                 { message -> execution.complete(ExecutionOutcome.Error(message)) },
+                 onNativeTerminalSignal,
               )
             }
-            execution.awaitTerminal(timeoutSeconds)
+            execution.startProgressWatchdog(effectiveWatchdogPolicy)
+            execution.awaitTerminal()
           } catch (t: Throwable) {
             if (t is OutOfMemoryError) System.gc()
             reportGatewayFailure(onCaughtThrowable, "Blocking inference failed", t)
@@ -443,6 +590,7 @@ object InferenceGateway {
     } catch (t: Throwable) {
       reportGatewayFailure(onCaughtThrowable, "Blocking executor rejected inference", t)
       execution.complete(ExecutionOutcome.Error("executor_rejected"))
+      reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
       execution.settle(
         recover = recoverConversation,
         finish = onInferenceFinished,
@@ -479,16 +627,20 @@ object InferenceGateway {
     }
     if (execution.isSettled()) runtimeHealth.markSettled(runtimeOwner)
     val totalMs = elapsedMs() - startMs
+    val terminalOutcome = execution.awaitTerminal()
+    val gatewayTerminalOutcome = gatewayOutcome(terminalOutcome)
+    reportGatewayOutcome(gatewayTerminalOutcome)
     val thinkingResult = thinkingSb.toString().takeIf { it.isNotEmpty() }
-    val finalError = when (val outcome = execution.awaitTerminal(0)) {
+    if (terminalOutcome is ExecutionOutcome.Timeout) onTimeoutKind(terminalOutcome.kind)
+    val finalError = when (terminalOutcome) {
       ExecutionOutcome.Success -> null
       ExecutionOutcome.Stopped -> null
-      ExecutionOutcome.Timeout -> "timeout"
-      is ExecutionOutcome.Cancelled -> when (outcome.reason) {
+      is ExecutionOutcome.Timeout -> "timeout"
+      is ExecutionOutcome.Cancelled -> when (terminalOutcome.reason) {
         CancellationReason.CALLER -> "client_disconnected"
         CancellationReason.EXTERNAL -> "cancelled"
       }
-      is ExecutionOutcome.Error -> outcome.message
+      is ExecutionOutcome.Error -> terminalOutcome.message
     }
     // On error, discard all accumulated tokens — SDK errors may leave the output buffer
     // in a corrupted/incomplete state. The streaming path (executeStreaming) preserves
@@ -499,6 +651,7 @@ object InferenceGateway {
       error = finalError,
       totalMs = totalMs,
       ttfbMs = firstTokenMs ?: -1,
+      gatewayTerminalOutcome = gatewayTerminalOutcome,
     )
   }
 

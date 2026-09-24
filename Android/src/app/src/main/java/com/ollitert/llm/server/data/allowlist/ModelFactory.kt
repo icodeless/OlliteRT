@@ -20,8 +20,8 @@ import com.ollitert.llm.server.data.model.IMPORTS_DIR
 import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.model.ModelCapability
 import com.ollitert.llm.server.data.model.RuntimeType
-import com.ollitert.llm.server.data.prefs.MIN_MAX_TOKENS
 import com.ollitert.llm.server.data.prefs.ServerPrefs
+import com.ollitert.llm.server.data.prefs.DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS
 import com.ollitert.llm.server.data.prefs.convertValueToTargetType
 import com.ollitert.llm.server.data.prefs.createLlmChatConfigs
 
@@ -63,15 +63,9 @@ object ModelFactory {
       Accelerator.entries.firstOrNull { it.label == label.trim() }
     }.toMutableList()
 
-    // Use the user-configured max tokens as both the default and the context window upper bound,
-    // so the inference settings sheet shows a slider the user can adjust up to their chosen limit.
-    // Only pass defaultMaxContextLength when the value exceeds the slider minimum used in
-    // createLlmChatConfigs — otherwise the slider range would be inverted (min > max).
     val maxTokens = info.llmConfig.defaultMaxTokens
-    val contextLength = if (maxTokens > MIN_MAX_TOKENS) maxTokens else null
     val configs = createLlmChatConfigs(
       defaultMaxToken = maxTokens,
-      defaultMaxContextLength = contextLength,
       defaultTopK = info.llmConfig.defaultTopk,
       defaultTopP = info.llmConfig.defaultTopp,
       defaultTemperature = info.llmConfig.defaultTemperature,
@@ -102,6 +96,9 @@ object ModelFactory {
         if (info.llmConfig.supportSpeculativeDecoding) add(ModelCapability.SPECULATIVE_DECODING)
       },
       llmMaxToken = info.llmConfig.defaultMaxTokens,
+      declaredMaxContextTokens = info.llmConfig.defaultMaxContextTokens
+        .takeIf { it > 0 }
+        ?: DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS,
       accelerators = accelerators,
       // All imported models are assumed to be LLM for now.
       isLlm = true,

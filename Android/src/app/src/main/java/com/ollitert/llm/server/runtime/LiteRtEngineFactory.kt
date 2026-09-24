@@ -39,6 +39,7 @@ import com.ollitert.llm.server.common.ServerMetrics
 import com.ollitert.llm.server.data.model.Accelerator
 import com.ollitert.llm.server.data.prefs.ConfigKeys
 import com.ollitert.llm.server.data.prefs.DEFAULT_MAX_TOKEN
+import com.ollitert.llm.server.data.prefs.DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS
 import com.ollitert.llm.server.data.prefs.DEFAULT_TEMPERATURE
 import com.ollitert.llm.server.data.prefs.DEFAULT_TOPK
 import com.ollitert.llm.server.data.prefs.DEFAULT_TOPP
@@ -50,6 +51,7 @@ import com.ollitert.llm.server.data.model.LogLevel
 import com.ollitert.llm.server.data.prefs.MIN_STORAGE_FOR_MODEL_INIT_BYTES
 import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.model.ModelCapability
+import com.ollitert.llm.server.data.model.modelMaxContextTokens
 import com.ollitert.llm.server.data.repository.RequestLogStore
 import com.ollitert.llm.server.data.prefs.SAMPLER_SEED_CONFIG_KEY
 import com.ollitert.llm.server.data.prefs.ServerPrefs
@@ -240,6 +242,14 @@ object LiteRtEngineFactory {
     enableConversationConstrainedDecoding: Boolean,
     onDone: (String) -> Unit,
   ) {
+    // A failed reload must not leave the previous engine capacity visible to the UI or context
+    // manager. The native attempt below is transactional and will repopulate these fields only
+    // after both engine and conversation creation succeed.
+    model.engineContextTokens = 0
+    model.engineContextSource = "unknown"
+    model.engineMaxOutputTokens = 0
+    model.engineSafetyReserveTokens = 0
+    model.engineUsableInputTokens = 0
     val validationError = validateModelFileAndStorage(context, model)
     if (validationError != null) {
       onDone(validationError)
@@ -266,7 +276,25 @@ object LiteRtEngineFactory {
     val canFallbackToCpu = backendResolution.canFallbackToCpu
     val modelPath = model.getPath(context = context)
 
-    fun engineConfigFor(backend: Backend, vision: Backend) = EngineConfig(
+    val declaredMaxContextTokens = (configOverrides?.get(ConfigKeys.MAX_CONTEXT_LENGTH.id) as? Number)?.toInt()
+      ?: model.modelMaxContextTokens
+      ?: DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS
+    val capacityPlan = FlowAssistContextCapacityPlanner.plan(
+      context = context,
+      modelId = model.name,
+      modelVersion = model.version,
+      modelSizeBytes = model.totalBytes,
+      modelMinDeviceMemoryInGb = model.minDeviceMemoryInGb,
+      modelMaxContextTokens = declaredMaxContextTokens,
+      maxOutputTokens = maxTokens,
+      backend = preferredBackend::class.simpleName ?: "unknown",
+    )
+    Log.i(TAG, "Context capacity for '${model.name}': modelMax=${capacityPlan.modelMaxContextTokens}, " +
+      "engine=${capacityPlan.engineContextTokens}, usableInput=${capacityPlan.usableInputTokens}, " +
+      "maxOutput=${capacityPlan.maxOutputTokens}, source=${capacityPlan.source}, " +
+      "tiers=${capacityPlan.candidateTiers}")
+
+    fun engineConfigFor(backend: Backend, vision: Backend, contextTokens: Int) = EngineConfig(
       modelPath = modelPath,
       backend = backend,
       visionBackend = if (supportImage) vision else null,
@@ -277,7 +305,7 @@ object LiteRtEngineFactory {
         ServerPrefs.isAudioGpuAccelerationEnabled(context) -> Backend.GPU()
         else -> Backend.CPU()
       },
-      maxNumTokens = maxTokens,
+      maxNumTokens = contextTokens,
       cacheDir =
         if (modelPath.startsWith("/data/local/tmp"))
           context.getExternalFilesDir(null)?.absolutePath
@@ -300,47 +328,32 @@ object LiteRtEngineFactory {
       ModelCapability.SPECULATIVE_DECODING in model.capabilities &&
       specDecUserEnabled
 
-    try {
-      model.instance = initEngineWithConversation(
-        engineConfig = engineConfigFor(preferredBackend, visionBackend),
-        enableSpeculativeDecoding = enableSpeculativeDecoding,
-        enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
-        topK = topK,
-        topP = topP,
-        temperature = temperature,
-        seed = seed,
-        systemInstruction = systemInstruction,
-        tools = tools,
-        initialMessages = initialMessages,
-      )
-      Log.i(TAG, "Engine initialized successfully on ${preferredBackend::class.simpleName} for '${model.name}'" +
-        " (speculative_decoding=$enableSpeculativeDecoding)")
-      RequestLogStore.addEvent(
-        "Engine initialized on ${preferredBackend::class.simpleName}" +
-          if (enableSpeculativeDecoding) " (MTP enabled)" else "",
-        level = LogLevel.INFO,
-        modelName = model.name,
-        category = EventCategory.MODEL,
-      )
-    } catch (e: Exception) {
-      Log.e(TAG, "Engine init failed for '${model.name}' with ${preferredBackend::class.simpleName}: " +
-        "[${e::class.simpleName}] ${e.message}", e)
-      // Safety-net: retry with CPU fallback if GPU init failed
+    val backendAttempts = buildList {
+      add(preferredBackend to visionBackend)
       if (preferredBackend is Backend.GPU && canFallbackToCpu) {
-        Log.w(TAG, "GPU initialization failed, retrying with CPU backend")
+        add(Backend.CPU() to Backend.CPU())
+      }
+    }
+    var lastFailure: Throwable? = null
+    var successfulBackend: Backend? = null
+    var successfulContext = 0
+
+    for ((backend, vision) in backendAttempts) {
+      if (backend is Backend.CPU && preferredBackend is Backend.GPU) {
+        Log.w(TAG, "GPU initialization failed or was unavailable, retrying with CPU backend")
         ServerMetrics.onCpuFallbackStarted()
         RequestLogStore.addEvent(
-          "GPU init failed, retrying with CPU: ${e.message?.take(LOG_ERROR_PREVIEW_SHORT_CHARS)}",
+          "Retrying model initialization on CPU",
           level = LogLevel.WARNING,
           modelName = model.name,
           category = EventCategory.MODEL,
         )
+      }
+      for (contextTokens in capacityPlan.candidateTiers) {
         try {
           model.instance = initEngineWithConversation(
-            // CPU fallback also forces the vision backend to CPU — a GPU that just failed
-            // for the main backend is unlikely to succeed for vision either.
-            engineConfig = engineConfigFor(Backend.CPU(), Backend.CPU()),
-            enableSpeculativeDecoding = false,
+            engineConfig = engineConfigFor(backend, vision, contextTokens),
+            enableSpeculativeDecoding = enableSpeculativeDecoding && backend !is Backend.CPU,
             enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
             topK = topK,
             topP = topP,
@@ -350,37 +363,71 @@ object LiteRtEngineFactory {
             tools = tools,
             initialMessages = initialMessages,
           )
-          Log.i(TAG, "CPU fallback successful for '${model.name}'")
+          successfulBackend = backend
+          successfulContext = contextTokens
+          break
+        } catch (attemptFailure: Throwable) {
+          lastFailure = attemptFailure
+          model.instance = null
+          Log.w(TAG, "Engine init failed for '${model.name}' on " +
+            "${backend::class.simpleName} context=$contextTokens: " +
+            "[${attemptFailure::class.simpleName}] ${attemptFailure.message}")
           RequestLogStore.addEvent(
-            "Model loaded on CPU (GPU unavailable on this device)",
-            level = LogLevel.INFO,
-            modelName = model.name,
-            category = EventCategory.MODEL,
-          )
-          onDone("")
-          return
-        } catch (fallbackEx: Exception) {
-          Log.e(TAG, "CPU fallback also failed for '${model.name}': " +
-            "[${fallbackEx::class.simpleName}] ${fallbackEx.message}", fallbackEx)
-          RequestLogStore.addEvent(
-            "CPU fallback failed: [${fallbackEx::class.simpleName}] ${fallbackEx.message?.take(LOG_ERROR_PREVIEW_LONG_CHARS)}",
-            level = LogLevel.ERROR,
+            "Engine init failed backend=${backend::class.simpleName} context=$contextTokens: " +
+              attemptFailure.message?.take(LOG_ERROR_PREVIEW_SHORT_CHARS),
+            level = LogLevel.WARNING,
             modelName = model.name,
             category = EventCategory.MODEL,
           )
         }
-      } else {
-        RequestLogStore.addEvent(
-          "${preferredBackend::class.simpleName} init failed: [${e::class.simpleName}] ${e.message?.take(LOG_ERROR_PREVIEW_LONG_CHARS)}",
-          level = LogLevel.ERROR,
-          modelName = model.name,
-          category = EventCategory.MODEL,
-        )
       }
+      if (successfulBackend != null) break
+    }
 
-      onDone(cleanUpLiteRtErrorMessage(e.message ?: context.getString(R.string.error_unknown)))
+    val backend = successfulBackend
+    if (backend == null || model.instance == null) {
+      val failure = lastFailure
+      RequestLogStore.addEvent(
+        "All engine initialization attempts failed: [${failure?.javaClass?.simpleName}] " +
+          failure?.message?.take(LOG_ERROR_PREVIEW_LONG_CHARS),
+        level = LogLevel.ERROR,
+        modelName = model.name,
+        category = EventCategory.MODEL,
+      )
+      onDone(cleanUpLiteRtErrorMessage(failure?.message ?: context.getString(R.string.error_unknown)))
       return
     }
+
+    model.engineContextTokens = successfulContext
+    model.engineContextSource = if (successfulContext == capacityPlan.engineContextTokens) {
+      capacityPlan.source
+    } else {
+      "native_fallback"
+    }
+    model.engineMaxOutputTokens = capacityPlan.maxOutputTokens.coerceAtMost(
+      (successfulContext - capacityPlan.safetyReserveTokens - FlowAssistContextCapacityPlanner.MIN_INPUT_TOKENS)
+        .coerceAtLeast(1),
+    )
+    model.engineSafetyReserveTokens = capacityPlan.safetyReserveTokens
+    model.engineUsableInputTokens = (successfulContext - model.engineMaxOutputTokens - model.engineSafetyReserveTokens)
+      .coerceAtLeast(1)
+    FlowAssistContextCapacityPlanner.recordSuccessfulTier(
+      context = context,
+      modelId = model.name,
+      modelVersion = model.version,
+      backend = backend::class.simpleName ?: "unknown",
+      engineContextTokens = successfulContext,
+    )
+    Log.i(TAG, "Engine initialized successfully on ${backend::class.simpleName} for '${model.name}' " +
+      "context=$successfulContext source=${model.engineContextSource} " +
+      "(speculative_decoding=${enableSpeculativeDecoding && backend !is Backend.CPU})")
+    RequestLogStore.addEvent(
+      "Engine initialized on ${backend::class.simpleName} context=$successfulContext " +
+        if (enableSpeculativeDecoding && backend !is Backend.CPU) "(MTP enabled)" else "",
+      level = LogLevel.INFO,
+      modelName = model.name,
+      category = EventCategory.MODEL,
+    )
     onDone("")
   }
 
