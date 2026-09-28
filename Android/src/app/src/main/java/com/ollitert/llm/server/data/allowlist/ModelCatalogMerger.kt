@@ -48,8 +48,42 @@ class ModelCatalogMerger(
       lastContentVersion = fresh.contentVersion
       return fresh.models
     }
+
+    // If disk caches exist but are corrupt, empty, or incompatible, keep the official bundled
+    // catalog usable. This is the same canonical merger used by both model listing and lookup;
+    // otherwise the UI can show fallback models that pickModelByName() cannot resolve.
+    if (isOfficialSourceEnabled()) {
+      val bundled = readBundledAllowlist()
+      val compatibleBundled = if (bundled != null && appVersion != null) {
+        bundled.filterCompatible(appVersion)
+      } else {
+        bundled
+      }
+      if (compatibleBundled != null && compatibleBundled.models.isNotEmpty()) {
+        cached = compatibleBundled
+        lastSource = "asset-fallback"
+        lastContentVersion = compatibleBundled.contentVersion
+        return compatibleBundled.models
+      }
+    }
+
     if (lastSource == "unknown") lastSource = "empty"
     return cached?.models ?: emptyList()
+  }
+
+  private fun isOfficialSourceEnabled(): Boolean {
+    val enabled = enabledCacheFilenames() ?: return true
+    return MODEL_ALLOWLIST_OFFICIAL_FILENAME in enabled
+  }
+
+  private fun readBundledAllowlist(): ModelAllowlist? {
+    val assetContent = assetReader() ?: return null
+    return try {
+      ModelAllowlistJson.decode(assetContent)
+    } catch (e: Exception) {
+      onError("asset-fallback", e)
+      null
+    }
   }
 
   private fun readFromFiles(): ModelAllowlist? {

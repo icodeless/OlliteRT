@@ -191,6 +191,25 @@ class ModelCatalogMergerTest {
   }
 
   @Test
+  fun fallsBackToBundledCatalogWhenExternalCacheIsMalformed() {
+    val dir = createTempDirectory("allowlist-test").toFile()
+    try {
+      File(dir, MODEL_ALLOWLIST_OFFICIAL_FILENAME).writeText("not valid json {{{")
+      val loader = ModelCatalogMerger(
+        externalFilesDir = dir,
+        assetReader = { minimalAllowlistJson },
+      )
+
+      val result = loader.load()
+
+      assertEquals(listOf("TestModel"), result.map { it.name })
+      assertEquals("asset-fallback", loader.lastSource)
+    } finally {
+      dir.deleteRecursively()
+    }
+  }
+
+  @Test
   fun filtersModelsByAppVersionWhenProvided() {
     val dir = createTempDirectory("allowlist-test").toFile()
     try {
