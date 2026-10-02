@@ -279,15 +279,21 @@ object LiteRtEngineFactory {
     val declaredMaxContextTokens = (configOverrides?.get(ConfigKeys.MAX_CONTEXT_LENGTH.id) as? Number)?.toInt()
       ?: model.modelMaxContextTokens
       ?: DEFAULT_IMPORTED_MAX_CONTEXT_TOKENS
-    val capacityPlan = FlowAssistContextCapacityPlanner.plan(
-      context = context,
-      modelId = model.name,
-      modelVersion = model.version,
-      modelSizeBytes = model.totalBytes,
-      modelMinDeviceMemoryInGb = model.minDeviceMemoryInGb,
+    // The store is read here, at the orchestration boundary, because only the attempt loop below
+    // knows which tier actually initialized. The planner itself stays pure.
+    val tierStore = ContextCapacitySupport.tierStore()
+    val capacityPlan = ContextCapacityPlanner.plan(
       modelMaxContextTokens = declaredMaxContextTokens,
       maxOutputTokens = maxTokens,
-      backend = preferredBackend::class.simpleName ?: "unknown",
+      backend = preferredBackend,
+      memory = ContextCapacitySupport.currentMemory(),
+      preferredTier = tierStore.readPreferredTier(
+        modelId = model.name,
+        modelVersion = model.version,
+        backend = preferredBackend,
+      ),
+      modelSizeBytes = model.totalBytes,
+      modelMinDeviceMemoryInGb = model.minDeviceMemoryInGb,
     )
     Log.i(TAG, "Context capacity for '${model.name}': modelMax=${capacityPlan.modelMaxContextTokens}, " +
       "engine=${capacityPlan.engineContextTokens}, usableInput=${capacityPlan.usableInputTokens}, " +
@@ -405,18 +411,18 @@ object LiteRtEngineFactory {
       "native_fallback"
     }
     model.engineMaxOutputTokens = capacityPlan.maxOutputTokens.coerceAtMost(
-      (successfulContext - capacityPlan.safetyReserveTokens - FlowAssistContextCapacityPlanner.MIN_INPUT_TOKENS)
+      (successfulContext - capacityPlan.safetyReserveTokens - ContextCapacityPlanner.MIN_INPUT_TOKENS)
         .coerceAtLeast(1),
     )
     model.engineSafetyReserveTokens = capacityPlan.safetyReserveTokens
     model.engineUsableInputTokens = (successfulContext - model.engineMaxOutputTokens - model.engineSafetyReserveTokens)
       .coerceAtLeast(1)
-    FlowAssistContextCapacityPlanner.recordSuccessfulTier(
-      context = context,
+    // Recorded only now, after the engine genuinely initialized on this backend.
+    tierStore.recordSuccessfulTier(
       modelId = model.name,
       modelVersion = model.version,
-      backend = backend::class.simpleName ?: "unknown",
-      engineContextTokens = successfulContext,
+      backend = backend,
+      tier = successfulContext,
     )
     Log.i(TAG, "Engine initialized successfully on ${backend::class.simpleName} for '${model.name}' " +
       "context=$successfulContext source=${model.engineContextSource} " +
