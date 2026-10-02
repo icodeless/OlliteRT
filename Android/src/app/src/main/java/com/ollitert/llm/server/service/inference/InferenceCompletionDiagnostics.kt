@@ -233,9 +233,9 @@ class InferenceCompletionEvidence(
     firstProgressTimeoutMs: Long = 0L,
     idleProgressTimeoutMs: Long = 0L,
     backend: String? = null,
-    nativeContextBefore: Long,
-    nativeContextAfter: Long,
-    contextCompacted: Boolean,
+    nativeContextBefore: Long = 0L,
+    nativeContextAfter: Long = 0L,
+    contextCompacted: Boolean = false,
     overflowRetryAttempted: Boolean = false,
   ): InferenceCompletionDiagnostic? {
     if (!terminalRecorded.compareAndSet(false, true)) return null
