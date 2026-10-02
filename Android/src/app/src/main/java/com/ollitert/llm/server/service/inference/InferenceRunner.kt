@@ -223,6 +223,7 @@ class InferenceRunner(
         session.runInference(input, onPartial, onError, onNativeTerminal)
       },
       cancelInference = { ServerLlmModelHelper.stopResponse(model) },
+      deferNativeCancellation = images.isNotEmpty(),
       recoverConversation = session::recoverConversation,
       onInferenceFinished = {
         session.restoreOriginalConfigIfLoaded()

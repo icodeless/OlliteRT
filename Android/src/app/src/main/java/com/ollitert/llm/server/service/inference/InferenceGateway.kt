@@ -68,6 +68,7 @@ private const val TAG = "OlliteRT.Gateway"
  * blocking its coroutine (and the inference lock queue behind it) forever.
  */
 private const val POST_CANCEL_SETTLEMENT_TIMEOUT_MS = 10_000L
+private const val IMAGE_NATIVE_TERMINAL_TIMEOUT_MS = 120_000L
 
 private fun reportGatewayFailure(
   onCaughtThrowable: ((Throwable) -> Unit)?,
@@ -137,14 +138,18 @@ object InferenceGateway {
   private class RequestExecution(
     private val cancelNative: () -> Unit,
     private val onNativeCancellationStarting: (RequestExecution) -> Unit,
+    private val deferNativeCancellation: Boolean,
+    private val nativeSettlementTimeoutMs: Long,
   ) : InferenceControl {
     private val stateLock = Any()
     private val terminalSignal = CountDownLatch(1)
     private val settledSignal = CountDownLatch(1)
+    private val nativeTerminalSignal = CountDownLatch(1)
     private var phase = ExecutionPhase.QUEUED
     private var outcome: ExecutionOutcome? = null
     private var nativeDispatched = false
     private var nativeCancellationStarted = false
+    private var reusableAfterSettlement = true
     private var pendingProgressAtMs = 0L
     private var progressWatchdog: InferenceProgressWatchdog? = null
     private var progressWatchdogFuture: ScheduledFuture<*>? = null
@@ -237,6 +242,17 @@ object InferenceGateway {
       true
     }
 
+    fun noteNativeTerminal() {
+      // Signal from the result/error callback, not the earlier diagnostic signal emitted
+      // by ServerLlmModelHelper before it delivers that callback.
+      nativeTerminalSignal.countDown()
+    }
+
+    fun needsNativeTerminalBeforeRecovery(): Boolean = synchronized(stateLock) {
+      deferNativeCancellation && nativeDispatched &&
+        outcome?.requiresNativeCancellation() == true
+    }
+
     private fun stopProgressWatchdog() {
       progressWatchdogFuture?.cancel(false)
       progressWatchdogFuture = null
@@ -247,13 +263,14 @@ object InferenceGateway {
       recover: () -> Unit,
       finish: () -> Unit,
       onFailure: (Throwable) -> Unit,
-    ) {
+    ): Boolean {
       val terminal = synchronized(stateLock) {
         phase = ExecutionPhase.SETTLING
         requireNotNull(outcome)
       }
       val shouldCancelNative = synchronized(stateLock) {
-        if (terminal.requiresNativeCancellation() && nativeDispatched && !nativeCancellationStarted) {
+        if (terminal.requiresNativeCancellation() && nativeDispatched &&
+          !deferNativeCancellation && !nativeCancellationStarted) {
           nativeCancellationStarted = true
           true
         } else {
@@ -268,7 +285,22 @@ object InferenceGateway {
           onFailure(t)
         }
       }
-      if (terminal.requiresRecovery() && nativeDispatched) {
+      // LiteRT-LM 0.16.1 can dereference a null native handle when cancelProcess() races
+      // image preprocessing. Let that request finish natively before replacing its conversation.
+      val nativeSettled = if (terminal.requiresNativeCancellation() && nativeDispatched &&
+        deferNativeCancellation) {
+        try {
+          nativeTerminalSignal.await(nativeSettlementTimeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+          Thread.currentThread().interrupt()
+          false
+        }
+      } else true
+      if (!nativeSettled) {
+        reusableAfterSettlement = false
+        Log.w(TAG, "Image inference did not reach a native terminal; runtime remains quarantined")
+      }
+      if (nativeSettled && terminal.requiresRecovery() && nativeDispatched) {
         try {
           recover()
         } catch (t: Throwable) {
@@ -284,6 +316,7 @@ object InferenceGateway {
         synchronized(stateLock) { phase = ExecutionPhase.FINISHED }
         settledSignal.countDown()
       }
+      return nativeSettled
     }
 
     fun awaitSettlement() {
@@ -295,6 +328,8 @@ object InferenceGateway {
       settledSignal.await(timeoutMs, TimeUnit.MILLISECONDS)
 
     fun isSettled(): Boolean = settledSignal.count == 0L
+
+    fun isReusableAfterSettlement(): Boolean = settledSignal.count == 0L && reusableAfterSettlement
 
     fun acceptsCallbacks(): Boolean = synchronized(stateLock) { outcome == null }
 
@@ -327,6 +362,8 @@ object InferenceGateway {
     runInference: InferenceFn,
     runInferenceWithDiagnostics: DiagnosticInferenceFn? = null,
     cancelInference: () -> Unit,
+    deferNativeCancellation: Boolean = false,
+    imageNativeTerminalTimeoutMs: Long = IMAGE_NATIVE_TERMINAL_TIMEOUT_MS,
     recoverConversation: () -> Unit = resetConversation,
     onToken: (partial: String, done: Boolean, thought: String?) -> Unit,
     onError: (error: String) -> Unit,
@@ -370,6 +407,8 @@ object InferenceGateway {
     }
     val execution = RequestExecution(
       cancelNative = cancelInference,
+      deferNativeCancellation = deferNativeCancellation,
+      nativeSettlementTimeoutMs = imageNativeTerminalTimeoutMs,
       onNativeCancellationStarting = { pendingExecution ->
         monitorSettlement(pendingExecution, runtimeHealth, runtimeOwner, postCancelSettlementTimeoutMs)
       },
@@ -384,6 +423,24 @@ object InferenceGateway {
     try {
       executor.execute {
         synchronized(inferenceLock) {
+          if (runtimeHealth.isQuarantined()) {
+            execution.complete(ExecutionOutcome.Error(INFERENCE_RUNTIME_QUARANTINED_ERROR))
+            reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
+            try {
+              onError(INFERENCE_RUNTIME_QUARANTINED_ERROR)
+            } catch (t: Throwable) {
+              reportGatewayFailure(onCaughtThrowable, "Streaming quarantine callback failed", t)
+            } finally {
+              execution.settle(
+                recover = recoverConversation,
+                finish = onInferenceFinished,
+                onFailure = { t -> reportGatewayFailure(onCaughtThrowable, "Streaming quarantine settlement failed", t) },
+              )
+              runtimeHealth.markSettled(runtimeOwner)
+              notifySettled()
+            }
+            return@synchronized
+          }
            if (!execution.beginPreparation()) {
              reportGatewayOutcome(GatewayTerminalOutcome.CANCELLED)
              runtimeHealth.markSettled(runtimeOwner)
@@ -402,12 +459,16 @@ object InferenceGateway {
                     if (execution.complete(ExecutionOutcome.Success)) {
                       onToken(partial, true, thought)
                     }
+                    execution.noteNativeTerminal()
                   } else if (execution.acceptsCallbacks()) {
                     onToken(partial, false, thought)
                   }
                 },
-                { message -> execution.complete(ExecutionOutcome.Error(message)) },
-                 onNativeTerminalSignal,
+                { message ->
+                  execution.complete(ExecutionOutcome.Error(message))
+                  execution.noteNativeTerminal()
+                },
+                onNativeTerminalSignal,
               )
             }
             execution.startProgressWatchdog(effectiveWatchdogPolicy)
@@ -418,6 +479,7 @@ object InferenceGateway {
             execution.complete(ExecutionOutcome.Error(t.message ?: "unknown_error"))
             execution.awaitTerminal()
           }
+          if (execution.needsNativeTerminalBeforeRecovery()) runtimeHealth.quarantine(runtimeOwner)
           try {
             reportGatewayOutcome(gatewayOutcome(terminal))
             when (terminal) {
@@ -438,14 +500,14 @@ object InferenceGateway {
           } catch (t: Throwable) {
             reportGatewayFailure(onCaughtThrowable, "Streaming terminal callback failed", t)
           } finally {
-            execution.settle(
+            val reusable = execution.settle(
               recover = recoverConversation,
               finish = onInferenceFinished,
               onFailure = { t ->
                 reportGatewayFailure(onCaughtThrowable, "Streaming settlement step failed", t)
               },
             )
-            runtimeHealth.markSettled(runtimeOwner)
+            if (reusable) runtimeHealth.markSettled(runtimeOwner)
             notifySettled()
           }
         }
@@ -486,6 +548,8 @@ object InferenceGateway {
     runInference: InferenceFn,
     runInferenceWithDiagnostics: DiagnosticInferenceFn? = null,
     cancelInference: () -> Unit,
+    deferNativeCancellation: Boolean = false,
+    imageNativeTerminalTimeoutMs: Long = IMAGE_NATIVE_TERMINAL_TIMEOUT_MS,
     recoverConversation: () -> Unit = resetConversation,
     onInferenceFinished: () -> Unit = {},
     elapsedMs: () -> Long,
@@ -526,6 +590,8 @@ object InferenceGateway {
     }
     val execution = RequestExecution(
       cancelNative = cancelInference,
+      deferNativeCancellation = deferNativeCancellation,
+      nativeSettlementTimeoutMs = imageNativeTerminalTimeoutMs,
       onNativeCancellationStarting = { pendingExecution ->
         monitorSettlement(pendingExecution, runtimeHealth, runtimeOwner, postCancelSettlementTimeoutMs)
       },
@@ -541,6 +607,17 @@ object InferenceGateway {
     try {
       executor.execute {
         synchronized(inferenceLock) {
+          if (runtimeHealth.isQuarantined()) {
+            execution.complete(ExecutionOutcome.Error(INFERENCE_RUNTIME_QUARANTINED_ERROR))
+            reportGatewayOutcome(GatewayTerminalOutcome.ERROR)
+            execution.settle(
+              recover = recoverConversation,
+              finish = onInferenceFinished,
+              onFailure = { t -> reportGatewayFailure(onCaughtThrowable, "Blocking quarantine settlement failed", t) },
+            )
+            runtimeHealth.markSettled(runtimeOwner)
+            return@synchronized
+          }
            if (!execution.beginPreparation()) {
              reportGatewayOutcome(GatewayTerminalOutcome.CANCELLED)
              runtimeHealth.markSettled(runtimeOwner)
@@ -563,10 +640,16 @@ object InferenceGateway {
                   if (!thought.isNullOrEmpty()) {
                     thinkingSb.append(thought)
                   }
-                  if (done) execution.complete(ExecutionOutcome.Success)
+                  if (done) {
+                    execution.complete(ExecutionOutcome.Success)
+                    execution.noteNativeTerminal()
+                  }
                 },
-                { message -> execution.complete(ExecutionOutcome.Error(message)) },
-                 onNativeTerminalSignal,
+                { message ->
+                  execution.complete(ExecutionOutcome.Error(message))
+                  execution.noteNativeTerminal()
+                },
+                onNativeTerminalSignal,
               )
             }
             execution.startProgressWatchdog(effectiveWatchdogPolicy)
@@ -576,14 +659,15 @@ object InferenceGateway {
             reportGatewayFailure(onCaughtThrowable, "Blocking inference failed", t)
             execution.complete(ExecutionOutcome.Error(t.message ?: "unknown_error"))
           } finally {
-            execution.settle(
+            if (execution.needsNativeTerminalBeforeRecovery()) runtimeHealth.quarantine(runtimeOwner)
+            val reusable = execution.settle(
               recover = recoverConversation,
               finish = onInferenceFinished,
               onFailure = { t ->
                 reportGatewayFailure(onCaughtThrowable, "Inference settlement step failed", t)
               },
             )
-            runtimeHealth.markSettled(runtimeOwner)
+            if (reusable) runtimeHealth.markSettled(runtimeOwner)
           }
         }
       }
@@ -625,7 +709,7 @@ object InferenceGateway {
         postCancelSettlementTimeoutMs,
       )
     }
-    if (execution.isSettled()) runtimeHealth.markSettled(runtimeOwner)
+    if (execution.isReusableAfterSettlement()) runtimeHealth.markSettled(runtimeOwner)
     val totalMs = elapsedMs() - startMs
     val terminalOutcome = execution.awaitTerminal()
     val gatewayTerminalOutcome = gatewayOutcome(terminalOutcome)

@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -613,6 +614,162 @@ class InferenceGatewayTest {
       job.cancel()
       job.join()
       assertTrue("cancelInference should be called on coroutine cancellation", cancelled)
+    } finally {
+      threadPool.shutdownNow()
+    }
+  }
+
+  @Test
+  fun imageCancellationWaitsForNativeTerminalBeforeRecovery() = runBlocking {
+    val threadPool = Executors.newSingleThreadExecutor()
+    val runtimeHealth = InferenceRuntimeHealth()
+    val started = CountDownLatch(1)
+    val finished = CountDownLatch(1)
+    val control = AtomicReference<InferenceGateway.InferenceControl>()
+    val nativeDone = AtomicReference<() -> Unit>()
+    val cancelCount = AtomicInteger(0)
+    val recoveryCount = AtomicInteger(0)
+    try {
+      val result = async(Dispatchers.Default) {
+        InferenceGateway.execute(
+          prompt = "image",
+          executor = threadPool,
+          inferenceLock = lock,
+          resetConversation = {},
+          runInference = { _, onPartial, _ ->
+            nativeDone.set { onPartial("", true, null) }
+            started.countDown()
+          },
+          cancelInference = { cancelCount.incrementAndGet() },
+          deferNativeCancellation = true,
+          imageNativeTerminalTimeoutMs = 2_000,
+          recoverConversation = { recoveryCount.incrementAndGet() },
+          onInferenceFinished = { finished.countDown() },
+          onExecutionReady = { control.set(it) },
+          runtimeHealth = runtimeHealth,
+          postCancelSettlementTimeoutMs = 2_000,
+          elapsedMs = { tick() },
+        )
+      }
+      assertTrue(started.await(5, TimeUnit.SECONDS))
+      assertTrue(control.get().cancel(InferenceGateway.CancellationReason.EXTERNAL))
+      assertFalse(finished.await(50, TimeUnit.MILLISECONDS))
+      assertEquals(0, cancelCount.get())
+      assertEquals(0, recoveryCount.get())
+
+      nativeDone.get().invoke()
+      assertEquals("cancelled", withTimeout(5_000) { result.await() }.error)
+      assertEquals(0, cancelCount.get())
+      assertEquals(1, recoveryCount.get())
+      assertFalse(runtimeHealth.isQuarantined())
+    } finally {
+      threadPool.shutdownNow()
+    }
+  }
+
+  @Test
+  fun imageCancellationWithoutNativeTerminalQuarantinesRuntime() = runBlocking {
+    val threadPool = Executors.newSingleThreadExecutor()
+    val runtimeHealth = InferenceRuntimeHealth()
+    val started = CountDownLatch(1)
+    val control = AtomicReference<InferenceGateway.InferenceControl>()
+    val cancelCount = AtomicInteger(0)
+    val recoveryCount = AtomicInteger(0)
+    try {
+      val result = async(Dispatchers.Default) {
+        InferenceGateway.execute(
+          prompt = "image",
+          executor = threadPool,
+          inferenceLock = lock,
+          resetConversation = {},
+          runInference = { _, _, _ -> started.countDown() },
+          cancelInference = { cancelCount.incrementAndGet() },
+          deferNativeCancellation = true,
+          imageNativeTerminalTimeoutMs = 50,
+          recoverConversation = { recoveryCount.incrementAndGet() },
+          onExecutionReady = { control.set(it) },
+          runtimeHealth = runtimeHealth,
+          postCancelSettlementTimeoutMs = 50,
+          elapsedMs = { tick() },
+        )
+      }
+      assertTrue(started.await(5, TimeUnit.SECONDS))
+      val queuedReady = CountDownLatch(1)
+      val queuedDispatchCount = AtomicInteger(0)
+      val queued = async(Dispatchers.Default) {
+        InferenceGateway.execute(
+          prompt = "already-admitted-next",
+          executor = threadPool,
+          inferenceLock = lock,
+          resetConversation = {},
+          runInference = { _, _, _ -> queuedDispatchCount.incrementAndGet() },
+          cancelInference = {},
+          onExecutionReady = { queuedReady.countDown() },
+          elapsedMs = { tick() },
+          runtimeHealth = runtimeHealth,
+        )
+      }
+      assertTrue(queuedReady.await(5, TimeUnit.SECONDS))
+      assertTrue(control.get().cancel(InferenceGateway.CancellationReason.EXTERNAL))
+      assertEquals("cancelled", withTimeout(5_000) { result.await() }.error)
+      assertEquals(0, cancelCount.get())
+      assertEquals(0, recoveryCount.get())
+      assertTrue(runtimeHealth.isQuarantined())
+      assertEquals(INFERENCE_RUNTIME_QUARANTINED_ERROR, withTimeout(5_000) { queued.await() }.error)
+      assertEquals(0, queuedDispatchCount.get())
+
+      val rejected = InferenceGateway.execute(
+        prompt = "next",
+        executor = directExecutor,
+        inferenceLock = lock,
+        resetConversation = {},
+        runInference = { _, onPartial, _ -> onPartial("unsafe", true, null) },
+        cancelInference = {},
+        elapsedMs = { tick() },
+        runtimeHealth = runtimeHealth,
+      )
+      assertEquals(INFERENCE_RUNTIME_QUARANTINED_ERROR, rejected.error)
+    } finally {
+      threadPool.shutdownNow()
+    }
+  }
+
+  @Test
+  fun streamingImageCancellationAlsoDefersNativeCancel() {
+    val threadPool = Executors.newSingleThreadExecutor()
+    val started = CountDownLatch(1)
+    val settled = CountDownLatch(1)
+    val control = AtomicReference<InferenceGateway.InferenceControl>()
+    val nativeDone = AtomicReference<() -> Unit>()
+    val cancelCount = AtomicInteger(0)
+    val recoveryCount = AtomicInteger(0)
+    try {
+      InferenceGateway.executeStreaming(
+        prompt = "image",
+        executor = threadPool,
+        inferenceLock = lock,
+        resetConversation = {},
+        runInference = { _, onPartial, _ ->
+          nativeDone.set { onPartial("", true, null) }
+          started.countDown()
+        },
+        cancelInference = { cancelCount.incrementAndGet() },
+        deferNativeCancellation = true,
+        imageNativeTerminalTimeoutMs = 2_000,
+        recoverConversation = { recoveryCount.incrementAndGet() },
+        onToken = { _, _, _ -> },
+        onError = {},
+        onExecutionReady = { control.set(it) },
+        onSettled = { settled.countDown() },
+      )
+      assertTrue(started.await(5, TimeUnit.SECONDS))
+      assertTrue(control.get().cancel(InferenceGateway.CancellationReason.EXTERNAL))
+      assertFalse(settled.await(50, TimeUnit.MILLISECONDS))
+      assertEquals(0, cancelCount.get())
+      nativeDone.get().invoke()
+      assertTrue(settled.await(5, TimeUnit.SECONDS))
+      assertEquals(0, cancelCount.get())
+      assertEquals(1, recoveryCount.get())
     } finally {
       threadPool.shutdownNow()
     }

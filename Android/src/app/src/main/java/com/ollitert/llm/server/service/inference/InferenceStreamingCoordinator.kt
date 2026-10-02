@@ -225,6 +225,7 @@ internal class InferenceStreamingCoordinator(
            session.runInference(input, onPartial, onError, onNativeTerminal)
          },
         cancelInference = { ServerLlmModelHelper.stopResponse(model) },
+        deferNativeCancellation = images.isNotEmpty(),
         recoverConversation = session::recoverConversation,
         onToken = { partial, done, thought ->
           channel.trySend(StreamEvent.Token(partial, done, thought))
