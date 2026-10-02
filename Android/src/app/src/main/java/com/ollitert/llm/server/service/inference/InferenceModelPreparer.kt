@@ -37,8 +37,12 @@ internal object InferenceModelPreparer {
   private const val TAG = "OlliteRT.Inference"
 
   /**
-   * Re-initialize the model if needed (null instance or missing vision support).
+   * Re-initialize the model if needed (null instance, or missing vision/audio support).
    * Must be called inside synchronized(inferenceLock). Returns an error message on failure, or null on success.
+   *
+   * Audio is checked as well as vision so an engine that lost its audio executor can recover.
+   * Without this, an engine initialized without audio stays permanently audio-less and every
+   * later audio request fails identically at the native boundary.
    */
   fun reinitIfNeeded(
     context: Context,
@@ -48,7 +52,8 @@ internal object InferenceModelPreparer {
     buildSystemInstruction: (modelName: String) -> Contents?,
   ): String? {
     val needsReinit = model.instance == null ||
-      (supportImage && !model.initializedWithVision)
+      (supportImage && !model.initializedWithVision) ||
+      (supportAudio && !model.initializedWithAudio)
     if (!needsReinit) return null
 
     if (model.instance != null) {
@@ -70,7 +75,8 @@ internal object InferenceModelPreparer {
       model.instance = null
       return err
     }
-    model.initializedWithVision = supportImage
+    // initializedWithVision/WithAudio are set by createAndInitEngine from the effective
+    // capability set, so they are not overwritten here from request scope.
     return null
   }
 }

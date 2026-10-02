@@ -258,8 +258,16 @@ data class Model(
   // The following fields are managed by the app. Don't need to set manually.
   //
   var normalizedName: String = "",
-  @Volatile var instance: Any? = null,
-  @Volatile var initializedWithVision: Boolean = false,
+    @Volatile var instance: Any? = null,
+    @Volatile var initializedWithVision: Boolean = false,
+    /**
+     * Whether the currently initialized engine carries an audio backend.
+     *
+     * Mirrors [initializedWithVision]. Without this, an engine initialized without audio can
+     * never be upgraded on demand, so whether audio inference works would depend on which
+     * request happened to arrive first.
+     */
+    @Volatile var initializedWithAudio: Boolean = false,
   @Volatile var configValues: Map<String, Any> = mapOf(),
   /** Effective EngineConfig.maxNumTokens for the currently initialized engine. */
   @Volatile var engineContextTokens: Int = 0,

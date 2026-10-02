@@ -350,6 +350,17 @@ class ModelLifecycle(
     val eagerVision = ServerPrefs.isEagerVisionInit(context)
     val supportImage = model.llmSupportImage && eagerVision
     val supportAudio = model.llmSupportAudio
+    // Engine capability trace. An audio-capable model whose engine ends up with a null
+    // audioBackend fails later at the native boundary with "Audio executor should not be
+    // null", so the four values that decide it are logged together.
+    Log.i(
+      "OlliteRT.EngineCaps",
+      "OLLITERT_ENGINE_CAPABILITIES model=${model.name} " +
+        "modelSupportText=true modelSupportVision=${model.llmSupportImage} " +
+        "modelSupportAudio=$supportAudio " +
+        "requestedSupportImage=$supportImage requestedSupportAudio=$supportAudio " +
+        "eagerVisionInit=$eagerVision",
+    )
     var initErr = ""
     ServerLlmModelHelper.initialize(
       context = context,
@@ -360,7 +371,8 @@ class ModelLifecycle(
       systemInstruction = buildSystemInstruction(model.prefsKey),
     )
     if (initErr.isEmpty()) {
-      model.initializedWithVision = supportImage
+      // initializedWithVision/WithAudio are set by createAndInitEngine from the effective
+      // (non-downgrading) capability set, so they are not written here from request scope.
     }
     return initErr
   }

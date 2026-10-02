@@ -52,6 +52,8 @@ import com.ollitert.llm.server.data.prefs.MIN_STORAGE_FOR_MODEL_INIT_BYTES
 import com.ollitert.llm.server.data.model.Model
 import com.ollitert.llm.server.data.model.ModelCapability
 import com.ollitert.llm.server.data.model.modelMaxContextTokens
+import com.ollitert.llm.server.data.model.llmSupportAudio
+import com.ollitert.llm.server.data.model.llmSupportImage
 import com.ollitert.llm.server.data.repository.RequestLogStore
 import com.ollitert.llm.server.data.prefs.SAMPLER_SEED_CONFIG_KEY
 import com.ollitert.llm.server.data.prefs.ServerPrefs
@@ -299,18 +301,45 @@ object LiteRtEngineFactory {
       "engine=${capacityPlan.engineContextTokens}, usableInput=${capacityPlan.usableInputTokens}, " +
       "maxOutput=${capacityPlan.maxOutputTokens}, source=${capacityPlan.source}, " +
       "tiers=${capacityPlan.candidateTiers}")
+    // Second half of the capability trace: the backends the engine will actually be built with.
+    // LiteRT-LM only initializes an audio executor when audioBackend is non-null, so an
+    // audio-capable model that resolves to a null audioBackend fails later at the native
+    // boundary rather than at engine creation.
+    //
+    // Non-downgrade invariant: a reinitialization may ADD a modality but must never REMOVE one
+    // the engine already has. Audio is additionally floored at the model's own capability, so an
+    // audio-capable model can never end up without an audio executor. Vision stays request-scoped
+    // for the initial load (eagerVisionInit is a deliberate cost policy) but is preserved once
+    // initialized, so a later reinit cannot cause vision/audio ping-pong.
+    val effectiveSupportAudio = supportAudio || model.llmSupportAudio || model.initializedWithAudio
+    val effectiveSupportImage = supportImage || model.initializedWithVision
+    val effectiveAudioBackend = when {
+      !effectiveSupportAudio -> null
+      ServerPrefs.isAudioGpuAccelerationEnabled(context) -> Backend.GPU()
+      else -> Backend.CPU()
+    }
+    Log.i(
+      TAG,
+      "OLLITERT_ENGINE_BACKENDS model='${model.name}' " +
+        "imported=${model.imported} " +
+        "capAudio=${model.llmSupportAudio} capVision=${model.llmSupportImage} " +
+        "requestedSupportAudio=$supportAudio requestedSupportImage=$supportImage " +
+        "initAudio=${model.initializedWithAudio} initVision=${model.initializedWithVision} " +
+        "effectiveSupportAudio=$effectiveSupportAudio effectiveSupportImage=$effectiveSupportImage " +
+        "mainBackend=${preferredBackend::class.simpleName} " +
+        "visionBackend=${if (effectiveSupportImage) visionBackend::class.simpleName else "none"} " +
+        "audioBackend=${effectiveAudioBackend?.let { it::class.simpleName } ?: "NULL"} " +
+        "audioGpuAccel=${ServerPrefs.isAudioGpuAccelerationEnabled(context)}",
+    )
 
     fun engineConfigFor(backend: Backend, vision: Backend, contextTokens: Int) = EngineConfig(
       modelPath = modelPath,
       backend = backend,
-      visionBackend = if (supportImage) vision else null,
+      visionBackend = if (effectiveSupportImage) vision else null,
       // GPU audio acceleration is opt-in (Settings → Model Behaviour): the
       // executor may be unsupported on some devices, so CPU stays the default.
-      audioBackend = when {
-        !supportAudio -> null
-        ServerPrefs.isAudioGpuAccelerationEnabled(context) -> Backend.GPU()
-        else -> Backend.CPU()
-      },
+      // Resolved once above so the logged trace and the built config cannot diverge.
+      audioBackend = effectiveAudioBackend,
       maxNumTokens = contextTokens,
       cacheDir =
         if (modelPath.startsWith("/data/local/tmp"))
@@ -405,6 +434,11 @@ object LiteRtEngineFactory {
     }
 
     model.engineContextTokens = successfulContext
+    // Record what the engine actually has, not what this request asked for. Downstream
+    // reinit decisions compare against these, so writing the narrower request-scoped value
+    // here would let the next reinit believe a modality had been dropped.
+    model.initializedWithVision = effectiveSupportImage
+    model.initializedWithAudio = effectiveSupportAudio
     model.engineContextSource = if (successfulContext == capacityPlan.engineContextTokens) {
       capacityPlan.source
     } else {
